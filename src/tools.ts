@@ -122,6 +122,8 @@ interface PendingApproval {
   messageId?: string;
   batchId?: string;
   target?: { name?: string; kind?: string; workspaceId?: string };
+  /** Parent runs (bots that delegated to this bot) blocked until this request is decided. */
+  blockedParents?: { messageId: string; conversationId: string; botId: string; botName: string }[];
   ask?: { action?: string; question?: string; options?: { label: string; description?: string }[] };
   createdAt?: string;
 }
@@ -146,13 +148,26 @@ async function allPending(client: MukaiClient, workspaceId?: string): Promise<Pe
   return [...found.values()];
 }
 
-async function pendingForRun(client: MukaiClient, result: ChatResult) {
-  if (!result.approvalMessageIds.length && result.status !== 'awaiting_approval') return [];
-  return (await allPending(client)).filter(
-    (item) =>
-      result.approvalMessageIds.includes(String(item.messageId)) ||
-      (result.conversationId && item.conversationId === result.conversationId),
+/** Whether a pending request belongs to a run: raised by it, or by a sub-bot it is waiting on. */
+function belongsToRun(item: PendingApproval, run: { conversationId?: string; assistantMessageId?: string; messageIds?: string[] }) {
+  if (run.messageIds?.includes(String(item.messageId))) return true;
+  if (run.conversationId && item.conversationId === run.conversationId) return true;
+  return !!item.blockedParents?.some(
+    (parent) =>
+      (run.conversationId && parent.conversationId === run.conversationId) ||
+      (run.assistantMessageId && parent.messageId === run.assistantMessageId),
   );
+}
+
+async function pendingForRun(client: MukaiClient, result: ChatResult) {
+  return (await allPending(client)).filter((item) =>
+    belongsToRun(item, { conversationId: result.conversationId, assistantMessageId: result.assistantMessageId, messageIds: result.approvalMessageIds }),
+  );
+}
+
+/** Used while a run streams: true when a sub-bot of this run is waiting for a decision. */
+async function runIsBlocked(client: MukaiClient, run: { conversationId?: string; assistantMessageId?: string }) {
+  return (await allPending(client)).some((item) => belongsToRun(item, run));
 }
 
 /** tool = a tool call waiting for permission; question = bot asks you something; yes_no = bot asks to proceed. */
@@ -173,6 +188,8 @@ function describeApproval(item: PendingApproval) {
     `Bot: ${item.botName ?? item.botId ?? 'unknown'}`,
   ];
   if (item.target?.name) lines.push(`Conversation: ${item.target.name}`);
+  if (item.blockedParents?.length)
+    lines.push(`Working for: ${item.blockedParents.map((parent) => parent.botName).join(' → ')} (delegated task)`);
   if (item.ask) {
     lines.push('', `Question: ${item.ask.question ?? ''}`);
     item.ask.options?.forEach((option, index) =>
@@ -359,6 +376,7 @@ export function registerTools(server: McpServer, client: MukaiClient, options: T
     workspaceName: names?.get(item.workspaceId),
     mcpApprovalMode: permissions.mode(item.workspaceId).mode,
     bot: item.botName ?? item.botId,
+    workingFor: item.blockedParents?.length ? item.blockedParents.map((parent) => parent.botName) : undefined,
     conversation: item.target?.name,
     conversationId: item.conversationId,
     batchId: item.batchId,
@@ -674,6 +692,7 @@ export function registerTools(server: McpServer, client: MukaiClient, options: T
         waitSeconds: remaining,
         returnOnApproval: handling !== 'wait',
         sendRequestId: reattachable,
+        blocked: (run) => runIsBlocked(client, run),
       });
       const pending = await pendingForRun(client, result);
       // Only requests the human must decide are prompted; the AI's own (full-access) ones go back to it.

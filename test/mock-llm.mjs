@@ -3,6 +3,7 @@
 //   WRITEFILE <name>  -> calls file_operations (a tool approval in ask-for-approval mode)
 //   ASKQ              -> asks the user a question with suggested answers (communicate/clarification)
 //   ASKOK             -> asks the user for a yes/no go-ahead (communicate/approval)
+//   DELEGATE <botId> <task>  -> hands <task> to a sub-bot (manage_bot send_message, mode wait)
 // Otherwise (or once the tool result is in) it replies with plain text.
 import http from 'node:http';
 const port = Number(process.env.MOCK_LLM_PORT || 11434);
@@ -16,7 +17,7 @@ http
     }
     const json = body ? JSON.parse(body) : {};
     const msgs = json.messages || [];
-    const asks = msgs.map((m, i) => [m, i]).filter(([m]) => m.role === 'user' && /WRITEFILE \S+|ASKQ|ASKOK/.test(JSON.stringify(m.content)));
+    const asks = msgs.map((m, i) => [m, i]).filter(([m]) => m.role === 'user' && /WRITEFILE \S+|ASKQ|ASKOK|DELEGATE/.test(JSON.stringify(m.content)));
     const ask = asks.pop();
     const toolResult = ask && msgs.slice(ask[1]).find((m) => m.role === 'tool');
     const base = { id: 'x', object: 'chat.completion.chunk', created: 1, model: 'mock-1' };
@@ -26,7 +27,11 @@ http
       const said = JSON.stringify(ask[0].content);
       let tool = 'communicate';
       let args;
-      if (/ASKQ/.test(said))
+      const delegate = /DELEGATE (\S+) (.+?)(\\n|"|$)/.exec(said);
+      if (delegate) {
+        tool = 'manage_bot';
+        args = { action: 'send_message', botId: delegate[1], message: delegate[2], mode: 'wait' };
+      } else if (/ASKQ/.test(said))
         args = { action: 'clarification', question: 'Which colour should the report use?', options: [
           { label: 'Blue', description: 'Calm and corporate', recommended: true },
           { label: 'Green', description: 'Fresh', recommended: false },

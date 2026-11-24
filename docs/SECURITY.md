@@ -126,6 +126,15 @@ full-access no approvals are created, so there's nothing for the MCP to decide. 
 workspaces on ask-for-approval if you want approvals to happen at all, and use the MCP modes
 and rules to choose who answers them.
 
+**Work Claude started includes sub-bots.** If the bot Claude asked delegates part of the job to
+a sub-bot, the sub-bot's approvals count as part of Claude's work. Mukai records which parent
+runs are waiting on each request (`blockedParents`). While a run is in progress, the chat tool
+checks for these every two seconds, because the parent's stream doesn't announce them. Such
+requests are shown as `workingFor: [parent bots]`, and prompts say "Working for: …".
+
+Work Claude didn't start (the Mukai app, pursuits, background tasks) is visible whenever Claude
+calls `mukai_list_pending_approvals`, for example when you ask "anything waiting for me?".
+
 When a bot run that the MCP started needs approval:
 
 | `approvalHandling` (chat tools) | Behavior |

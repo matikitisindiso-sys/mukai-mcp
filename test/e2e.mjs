@@ -426,6 +426,46 @@ await test('action rule: actions.delete = allow lets the AI delete a bot in this
   await human.client.close();
 });
 
+console.log('Sub-bots: approvals raised by bots that Claude\'s bot delegated to');
+
+const child = must(await mukai('POST', '/bots', {
+  workspaceId: workspace.id, name: 'Ada', role: 'Writer', instructions: 'x', providerId: provider.id, model: 'mock-1', supportsImages: null, avatar: 'mukai-logo',
+}), 'sub-bot');
+
+await test('sub-bot approval during Claude-started work is caught and shown as "working for" the parent', async () => {
+  const { client, call, prompts } = await connect(() => ({ action: 'accept', content: { decision: 'approve' } }));
+  const started = Date.now();
+  const r = await call('mukai_chat_with_bot', { botId: bot.id, text: `DELEGATE ${child.id} WRITEFILE sub-bot.txt`, waitSeconds: 40 });
+  assert.equal(r.json.status, 'done', r.text);
+  assert.equal(prompts.length, 2); // the parent's delegation, then the sub-bot's file write
+  assert.match(prompts[1].message, /Bot: Ada/);
+  assert.match(prompts[1].message, /Working for: Mukai/);
+  assert.ok(existsSync(file('sub-bot.txt')));
+  assert.ok(Date.now() - started < 30_000, 'should not wait out the timeout');
+  await client.close();
+});
+
+await test('without prompts: the sub-bot request comes back quickly with workingFor, not as "still working"', async () => {
+  const { client, call } = await connect(null);
+  const first = await call('mukai_chat_with_bot', { botId: bot.id, text: `DELEGATE ${child.id} WRITEFILE sub-bot-2.txt`, waitSeconds: 40 });
+  assert.equal(first.json.status, 'awaiting_approval', first.text);
+  assert.equal(first.json.pendingApprovals[0].tool, 'manage_bot');
+  await mukai('POST', `/approvals/${first.json.pendingApprovals[0].id}?workspaceId=${workspace.id}`, { approved: true }); // you, in the app
+  const started = Date.now();
+  const second = await call('mukai_chat_with_bot', { botId: bot.id, text: 'x', requestId: first.json.requestId, waitSeconds: 40 });
+  assert.equal(second.json.status, 'awaiting_approval', second.text);
+  assert.ok(Date.now() - started < 15_000, 'sub-bot approval should be noticed within seconds');
+  const sub = second.json.pendingApprovals[0];
+  assert.equal(sub.bot, 'Ada');
+  assert.deepEqual(sub.workingFor, ['Mukai']);
+  assert.equal(sub.decidedBy, 'human');
+  await mukai('POST', `/approvals/${sub.id}?workspaceId=${workspace.id}`, { approved: true });
+  const done = await call('mukai_chat_with_bot', { botId: bot.id, text: 'x', requestId: first.json.requestId, waitSeconds: 40 });
+  assert.equal(done.json.status, 'done', done.text);
+  assert.ok(existsSync(file('sub-bot-2.txt')));
+  await client.close();
+});
+
 console.log('Hardening');
 
 await test('raw API tool is not exposed by default; results are labelled untrusted', async () => {

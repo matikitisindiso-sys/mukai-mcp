@@ -141,7 +141,16 @@ export class MukaiClient {
   async chat(
     path: string,
     body: Record<string, unknown>,
-    options: { waitSeconds: number; returnOnApproval: boolean; sendRequestId?: boolean },
+    options: {
+      waitSeconds: number;
+      returnOnApproval: boolean;
+      sendRequestId?: boolean;
+      /**
+       * Polled every few seconds while the run is in progress. Returns true when something this
+       * run is waiting on needs a decision but the stream didn't say so (e.g. a sub-bot's approval).
+       */
+      blocked?: (run: { conversationId?: string; assistantMessageId?: string }) => Promise<boolean>;
+    },
   ): Promise<ChatResult> {
     const requestId = typeof body.requestId === 'string' ? body.requestId : randomUUID();
     const payload = options.sendRequestId === false ? body : { ...body, requestId };
@@ -155,6 +164,24 @@ export class MukaiClient {
       activity: [],
     };
     const activity = new Map<string, ChatResult['activity'][number]>();
+    let poller: ReturnType<typeof setInterval> | undefined;
+    if (options.blocked && options.returnOnApproval) {
+      let checking = false;
+      poller = setInterval(async () => {
+        if (checking || !result.conversationId || controller.signal.aborted) return;
+        checking = true;
+        try {
+          if (await options.blocked!({ conversationId: result.conversationId, assistantMessageId: result.assistantMessageId })) {
+            result.status = 'awaiting_approval';
+            controller.abort();
+          }
+        } catch {
+          /* a failed check is retried on the next tick */
+        } finally {
+          checking = false;
+        }
+      }, 2000);
+    }
     try {
       const response = await fetch(this.url(path), {
         method: 'POST',
@@ -241,6 +268,7 @@ export class MukaiClient {
       else if (!controller.signal.aborted) throw error;
     } finally {
       clearTimeout(timer);
+      if (poller) clearInterval(poller);
     }
     result.activity = [...activity.values()];
     return result;
