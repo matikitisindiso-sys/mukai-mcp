@@ -153,13 +153,24 @@ export class MukaiOAuth implements OAuthServerProvider {
     const id = secret();
     this.pending.set(id, { client, params, expires: Date.now() + PENDING_TTL_MS });
     res.status(200);
-    this.page(res, loginPage(id, client, params));
+    this.page(res, loginPage(id, client, params), params.redirectUri);
   }
 
-  private page(res: Response, html: string) {
+  /**
+   * Sends an HTML page. Browsers apply CSP form-action to the redirect that follows a form
+   * submission, so the login form must be allowed to continue to the app's registered
+   * callback origin (and only that), or "Allow" silently does nothing.
+   */
+  private page(res: Response, html: string, continueTo?: string) {
+    let callbackOrigin = '';
+    try {
+      if (continueTo) callbackOrigin = ' ' + new URL(continueTo).origin;
+    } catch {
+      /* no extra origin */
+    }
     res.set({
       'Content-Type': 'text/html; charset=utf-8',
-      'Content-Security-Policy': "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'",
+      'Content-Security-Policy': `default-src 'none'; style-src 'unsafe-inline'; form-action 'self'${callbackOrigin}; frame-ancestors 'none'; base-uri 'none'`,
       'X-Frame-Options': 'DENY',
       'Cache-Control': 'no-store',
       'Referrer-Policy': 'no-referrer',
@@ -192,7 +203,7 @@ export class MukaiOAuth implements OAuthServerProvider {
         this.loginFailures.fail(ip);
         audit({ event: 'oauth.login_failed', client: ip });
         res.status(401);
-        return this.page(res, loginPage(pendingId, item.client, item.params, 'Wrong password.'));
+        return this.page(res, loginPage(pendingId, item.client, item.params, 'Wrong password.'), item.params.redirectUri);
       }
       this.loginFailures.succeed(ip);
       this.pending.delete(pendingId);
