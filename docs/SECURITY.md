@@ -167,7 +167,7 @@ the mode and rules) come back to it rather than prompting the human.
 | `MCP_OAUTH_REDIRECT_HOSTS` | `claude.ai,claude.com` | Hosts allowed as OAuth callbacks (localhost always allowed) |
 | `MCP_OAUTH_STATE_FILE` | `data/oauth.json` | Registered apps and hashed tokens. Keep it on the persistent volume. |
 | `MCP_ALLOW_QUERY_TOKEN` | `false` | Accept `?token=` as a last resort for clients that can do neither OAuth nor headers |
-| `MCP_TRUST_PROXY` | `false` | Set `true` behind a reverse proxy so lockout uses the real client IP |
+| `MCP_TRUST_PROXY` | `false` | How to find each visitor's real address for lockout and rate limits: `cloudflare` (behind Cloudflare Tunnel or proxied DNS; uses `CF-Connecting-IP`; only when **all** traffic comes through Cloudflare), a number of proxies (e.g. `2`), or `true` (one proxy) |
 | `MCP_SESSION_TTL_MINUTES` / `MCP_MAX_SESSIONS` | `60` / `50` | Idle session expiry and session cap |
 | `MCP_MAX_BODY` | `20mb` | Request body limit |
 
@@ -176,7 +176,7 @@ the mode and rules) come back to it rather than prompting the human.
 1. Generate a strong token: `openssl rand -hex 32`. Store it in your platform's secret store,
    not in git.
 2. Serve the MCP endpoint **only over HTTPS**. Set `MCP_ALLOWED_HOSTS=mcp.yourdomain.com`, and
-   set `MCP_TRUST_PROXY=true` if it sits behind a proxy.
+   set `MCP_TRUST_PROXY` to match your proxies (`cloudflare` behind a Cloudflare Tunnel).
 3. Point `MUKAI_API_URL` at loopback, or at an HTTPS Mukai address. The server warns about
    anything else. If Mukai is behind Cloudflare Access, set the service token
    (`MUKAI_CF_ACCESS_CLIENT_ID/SECRET`) and add a Service Auth policy for it.

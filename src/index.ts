@@ -121,7 +121,23 @@ async function runHttp() {
 
   const app = express();
   app.disable('x-powered-by');
-  if (env('MCP_TRUST_PROXY') === 'true') app.set('trust proxy', 1);
+  // Which address identifies a visitor (for lockout and rate limits):
+  //   false (default)  the direct connection
+  //   true / <n>       the X-Forwarded-For entry n proxies back (true = 1)
+  //   cloudflare       Cloudflare's CF-Connecting-IP header (Cloudflare Tunnel / proxied DNS).
+  //                    Only use this when ALL traffic arrives through Cloudflare.
+  const trustProxy = (env('MCP_TRUST_PROXY', 'false') || 'false').toLowerCase();
+  if (trustProxy === 'cloudflare') {
+    app.set('trust proxy', true);
+    app.use((req, _res, next) => {
+      const visitor = req.headers['cf-connecting-ip'];
+      if (typeof visitor === 'string' && /^[0-9a-f:.]{2,45}$/i.test(visitor))
+        Object.defineProperty(req, 'ip', { value: visitor, configurable: true });
+      next();
+    });
+  } else if (trustProxy === 'true') app.set('trust proxy', 1);
+  else if (/^\d+$/.test(trustProxy)) app.set('trust proxy', Number(trustProxy));
+  else if (trustProxy !== 'false') fail('MCP_TRUST_PROXY must be false, true, a number of proxies, or "cloudflare".');
   if (allowedHosts?.length) app.use(hostHeaderValidation(allowedHosts));
   else if (host === '0.0.0.0' || host === '::')
     console.error('Note: set MCP_ALLOWED_HOSTS to your public hostname to enable Host header validation.');
@@ -271,7 +287,7 @@ async function runHttp() {
   app.listen(port, host, () => {
     console.error(
       `Mukai MCP server on http://${host}:${port}/mcp -> ${apiUrl} ` +
-        `[oauth=${oauth ? 'on' : 'off'} staticToken=${authToken ? 'on' : 'off'} profile=${policy.profile} approvalMode=${policy.approvalMode} rules=${policy.rulesFile ?? 'none'} cloudflareAccess=${cfId ? 'service-token' : 'off'} sensitive=${policy.sensitive} rawApi=${policy.rawApi}]`,
+        `[trustProxy=${trustProxy} oauth=${oauth ? 'on' : 'off'} staticToken=${authToken ? 'on' : 'off'} profile=${policy.profile} approvalMode=${policy.approvalMode} rules=${policy.rulesFile ?? 'none'} cloudflareAccess=${cfId ? 'service-token' : 'off'} sensitive=${policy.sensitive} rawApi=${policy.rawApi}]`,
     );
   });
 }
