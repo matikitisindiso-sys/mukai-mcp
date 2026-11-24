@@ -16,7 +16,7 @@
     "start:stdio": "node dist/index.js --stdio",
     "dev": "tsx src/index.ts",
     "typecheck": "tsc --noEmit",
-    "test": "npm run build && node --test test/rules.test.mjs test/proxy-ip.test.mjs",
+    "test": "npm run build && node --test test/rules.test.mjs test/proxy-ip.test.mjs test/health.test.mjs",
     "test:e2e": "node test/e2e.mjs"
   },
   "dependencies": {

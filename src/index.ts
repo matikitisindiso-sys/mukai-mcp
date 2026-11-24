@@ -138,6 +138,9 @@ async function runHttp() {
   } else if (trustProxy === 'true') app.set('trust proxy', 1);
   else if (/^\d+$/.test(trustProxy)) app.set('trust proxy', Number(trustProxy));
   else if (trustProxy !== 'false') fail('MCP_TRUST_PROXY must be false, true, a number of proxies, or "cloudflare".');
+  // Liveness check first: container health checks call http://127.0.0.1:3333/health, which the
+  // Host allowlist below would refuse. It reveals nothing beyond "up" and the version.
+  app.get('/health', (_req, res) => res.json({ status: 'ok', service: 'mukai-mcp', version: VERSION }));
   if (allowedHosts?.length) app.use(hostHeaderValidation(allowedHosts));
   else if (host === '0.0.0.0' || host === '::')
     console.error('Note: set MCP_ALLOWED_HOSTS to your public hostname to enable Host header validation.');
@@ -220,7 +223,6 @@ async function runHttp() {
       .json({ jsonrpc: '2.0', error: { code: -32001, message: 'Unauthorized' }, id: null });
   };
 
-  app.get('/health', (_req, res) => res.json({ status: 'ok', service: 'mukai-mcp', version: VERSION }));
   app.get('/health/backend', authenticate, async (_req, res) => {
     try {
       res.json({ status: 'ok', backend: await client.json('GET', '/health') });
