@@ -86,7 +86,8 @@ cp .env.example .env   # then fill in values; export them or use your platform's
 | `MUKAI_API_URL` | yes | Mukai backend base URL. See below. |
 | `MUKAI_CF_ACCESS_CLIENT_ID` / `MUKAI_CF_ACCESS_CLIENT_SECRET` | if Mukai is behind Cloudflare Access | Cloudflare Access service token. See below. |
 | `MUKAI_API_TOKEN` | yes | Mukai API token. Find it in **Mukai → Settings → API**, or read it from the `api.token` file in the Mukai data directory (that file holds raw bytes; the token is their hex: `od -An -tx1 -v api.token \| tr -d ' \n'`). |
-| `MCP_AUTH_TOKEN` | HTTP mode | Bearer token that clients must send to this server, at least 32 characters. Generate one with `openssl rand -hex 32`. |
+| `MCP_PUBLIC_URL` / `MCP_OWNER_PASSWORD` | for OAuth sign-in (Claude app) | Public HTTPS address of this server and the owner password for the login page. See "Claude app" below. |
+| `MCP_AUTH_TOKEN` | HTTP mode, unless OAuth is set | Bearer token that clients must send to this server, at least 32 characters. Generate one with `openssl rand -hex 32`. |
 | `PORT` / `HOST` | no | Listener address. Defaults to `3333` / `0.0.0.0`. |
 | `MCP_ALLOWED_HOSTS` | no | Comma-separated allowlist for the `Host` header, which protects against DNS rebinding, e.g. `mcp.example.com`. |
 | `MUKAI_CHAT_WAIT_SECONDS` | no | How long chat tools wait by default. Default `55`. Keep it below your client's tool timeout. |
@@ -159,9 +160,31 @@ claude mcp add --transport http mukai https://your-mcp-host/mcp \
   --header "Authorization: Bearer $MCP_AUTH_TOKEN"
 ```
 
-**Clients that only take a URL** (no custom headers): set `MCP_ALLOW_QUERY_TOKEN=true` and use
-`https://your-mcp-host/mcp?token=<MCP_AUTH_TOKEN>`. A token in a URL can end up in logs, so use
-the header wherever the client supports it.
+**Claude app (custom connector), with OAuth sign-in**
+
+1. On the server, set:
+   - `MCP_PUBLIC_URL=https://your-mcp-host` (the public HTTPS address, no path);
+   - `MCP_OWNER_PASSWORD`: at least 12 characters; you'll type it once when connecting.
+2. In the Claude app: **Settings → Connectors → Add custom connector**, URL
+   `https://your-mcp-host/mcp`, with no token in it.
+3. The app opens a **Connect to Mukai** page. Enter the owner password and press **Allow**.
+
+The app then receives an access token that expires after an hour and renews itself, and a
+refresh token that lasts 30 days and is replaced on every use. Neither is ever shown to you or
+put in a URL.
+
+- **Who can register:** only callback addresses on `claude.ai` and `claude.com`, plus localhost
+  for local apps. Change this with `MCP_OAUTH_REDIRECT_HOSTS`.
+- **To sign every app out:** change `MCP_OWNER_PASSWORD` and redeploy, or run
+  `node dist/index.js --revoke-oauth` with the same settings.
+- **Theft detection:** if an old refresh token is ever reused, that whole sign-in is ended
+  automatically.
+- **Static token too:** `MCP_AUTH_TOKEN` keeps working alongside OAuth, e.g. for Claude Code with
+  a header.
+
+**Clients that can neither sign in with OAuth nor send headers:** set
+`MCP_ALLOW_QUERY_TOKEN=true` and use `https://your-mcp-host/mcp?token=<MCP_AUTH_TOKEN>`. This is a
+last resort; a token in a URL can end up in logs.
 
 **Claude Desktop / other stdio clients**
 
@@ -202,6 +225,8 @@ node test/e2e.mjs
 ```
 
 Unit tests for the permission rules (no backend needed): `npm test`.
+OAuth sign-in test (the Claude app flow plus attacks): `node test/oauth.mjs` with `MUKAI_API_URL`,
+`MUKAI_API_TOKEN` and `TEST_FOLDER`.
 Cloudflare Access test (fake Access gate in front of a real Mukai): `node test/cf-access.mjs` with
 `MUKAI_API_URL`, `MUKAI_API_TOKEN` and `TEST_FOLDER`.
 

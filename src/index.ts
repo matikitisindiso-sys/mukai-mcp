@@ -10,8 +10,10 @@ import { MukaiClient } from './client.js';
 import { registerTools } from './tools.js';
 import { FailureLimiter, audit, loadPolicy } from './security.js';
 import { PermissionStore } from './rules.js';
+import { MukaiOAuth } from './oauth.js';
+import { mcpAuthRouter, getOAuthProtectedResourceMetadataUrl } from '@modelcontextprotocol/sdk/server/auth/router.js';
 
-const VERSION = '0.3.0';
+const VERSION = '0.4.0';
 
 function env(name: string, fallback?: string) {
   const value = process.env[name]?.trim();
@@ -78,10 +80,37 @@ async function runStdio() {
   console.error(`Mukai MCP server (stdio) -> ${apiUrl}`);
 }
 
+/** OAuth sign-in (for apps like the Claude app): enabled by MCP_OWNER_PASSWORD + MCP_PUBLIC_URL. */
+function loadOAuth() {
+  const password = env('MCP_OWNER_PASSWORD');
+  if (!password) return undefined;
+  if (password.length < 12) fail('MCP_OWNER_PASSWORD must be at least 12 characters.');
+  const publicUrl = env('MCP_PUBLIC_URL');
+  if (!publicUrl) fail('MCP_PUBLIC_URL (e.g. https://mcp.example.com) is required when MCP_OWNER_PASSWORD is set.');
+  let url: URL;
+  try {
+    url = new URL(publicUrl);
+  } catch {
+    fail('MCP_PUBLIC_URL must be a full URL such as https://mcp.example.com');
+  }
+  if (url.protocol !== 'https:' && !['localhost', '127.0.0.1'].includes(url.hostname))
+    fail('MCP_PUBLIC_URL must be https:// (sign-in must never travel unencrypted).');
+  return new MukaiOAuth({
+    publicUrl: new URL(url.origin),
+    ownerPassword: password,
+    stateFile: env('MCP_OAUTH_STATE_FILE', 'data/oauth.json')!,
+    redirectHosts: (env('MCP_OAUTH_REDIRECT_HOSTS', 'claude.ai,claude.com') || '')
+      .split(',')
+      .map((item) => item.trim().toLowerCase())
+      .filter(Boolean),
+  });
+}
+
 async function runHttp() {
   const authToken = env('MCP_AUTH_TOKEN');
-  if (!authToken && env('MCP_ALLOW_NO_AUTH') !== 'true')
-    fail('MCP_AUTH_TOKEN is required for HTTP mode (MCP_ALLOW_NO_AUTH=true only for trusted local testing).');
+  const oauth = loadOAuth();
+  if (!authToken && !oauth && env('MCP_ALLOW_NO_AUTH') !== 'true')
+    fail('Set MCP_AUTH_TOKEN and/or MCP_OWNER_PASSWORD + MCP_PUBLIC_URL (OAuth sign-in) for HTTP mode.');
   if (authToken && authToken.length < 32) fail('MCP_AUTH_TOKEN must be at least 32 characters (try: openssl rand -hex 32).');
   const allowQueryToken = env('MCP_ALLOW_QUERY_TOKEN') === 'true';
   const host = env('HOST', '0.0.0.0')!;
@@ -101,10 +130,38 @@ async function runHttp() {
     next();
   });
 
+  // OAuth: discovery metadata, client registration, /authorize, /token, /revoke, and the login form.
+  const metadataUrl = oauth ? getOAuthProtectedResourceMetadataUrl(oauth.resourceUrl) : undefined;
+  if (oauth) {
+    app.use(
+      mcpAuthRouter({
+        provider: oauth,
+        issuerUrl: new URL(oauth.resourceUrl.origin),
+        resourceServerUrl: oauth.resourceUrl,
+        scopesSupported: ['mukai'],
+        resourceName: 'Mukai',
+      }),
+    );
+    app.use(oauth.loginHandler());
+    // Some clients look for the resource metadata at the root as well.
+    app.get('/.well-known/oauth-protected-resource', (_req, res) =>
+      res.json({
+        resource: oauth.resourceUrl.href,
+        authorization_servers: [new URL(oauth.resourceUrl.origin).href],
+        scopes_supported: ['mukai'],
+        resource_name: 'Mukai',
+      }),
+    );
+  }
+
   const expected = authToken ? createHash('sha256').update(authToken).digest() : undefined;
   const limiter = new FailureLimiter(Number(env('MCP_AUTH_MAX_FAILURES', '10')), 10 * 60_000);
-  const authenticate = (req: Request, res: Response, next: NextFunction) => {
-    if (!expected) return next();
+  const challenge = (error?: string) =>
+    ['Bearer', [metadataUrl && `resource_metadata="${metadataUrl}"`, error && `error="${error}"`].filter(Boolean).join(', ')]
+      .filter(Boolean)
+      .join(' ');
+  const authenticate = async (req: Request, res: Response, next: NextFunction) => {
+    if (!expected && !oauth) return next();
     const client = req.ip || req.socket.remoteAddress || 'unknown';
     if (limiter.blocked(client)) {
       audit({ event: 'auth.locked_out', client });
@@ -118,13 +175,33 @@ async function runHttp() {
         : '';
     // Compare fixed-length digests so neither length nor content leaks through timing.
     const given = createHash('sha256').update(presented).digest();
-    if (presented && timingSafeEqual(given, expected)) {
+    if (presented && expected && timingSafeEqual(given, expected)) {
       limiter.succeed(client);
       return next();
     }
-    limiter.fail(client);
-    audit({ event: 'auth.failed', client, path: req.path });
-    res.status(401).set('WWW-Authenticate', 'Bearer').json({ jsonrpc: '2.0', error: { code: -32001, message: 'Unauthorized' }, id: null });
+    if (presented && oauth) {
+      try {
+        const info = await oauth.verifyAccessToken(presented);
+        limiter.succeed(client);
+        (req as Request & { auth?: unknown }).auth = info;
+        return next();
+      } catch {
+        // An expired token we issued is normal: the app refreshes it. No lockout penalty.
+        if (oauth.known(presented))
+          return res
+            .status(401)
+            .set('WWW-Authenticate', challenge('invalid_token'))
+            .json({ jsonrpc: '2.0', error: { code: -32001, message: 'Token expired' }, id: null });
+      }
+    }
+    if (presented) {
+      limiter.fail(client);
+      audit({ event: 'auth.failed', client, path: req.path });
+    }
+    res
+      .status(401)
+      .set('WWW-Authenticate', challenge(presented ? 'invalid_token' : undefined))
+      .json({ jsonrpc: '2.0', error: { code: -32001, message: 'Unauthorized' }, id: null });
   };
 
   app.get('/health', (_req, res) => res.json({ status: 'ok', service: 'mukai-mcp', version: VERSION }));
@@ -194,9 +271,17 @@ async function runHttp() {
   app.listen(port, host, () => {
     console.error(
       `Mukai MCP server on http://${host}:${port}/mcp -> ${apiUrl} ` +
-        `[profile=${policy.profile} approvalMode=${policy.approvalMode} rules=${policy.rulesFile ?? 'none'} cloudflareAccess=${cfId ? 'service-token' : 'off'} sensitive=${policy.sensitive} rawApi=${policy.rawApi}]`,
+        `[oauth=${oauth ? 'on' : 'off'} staticToken=${authToken ? 'on' : 'off'} profile=${policy.profile} approvalMode=${policy.approvalMode} rules=${policy.rulesFile ?? 'none'} cloudflareAccess=${cfId ? 'service-token' : 'off'} sensitive=${policy.sensitive} rawApi=${policy.rawApi}]`,
     );
   });
+}
+
+if (process.argv.includes('--revoke-oauth')) {
+  const oauth = loadOAuth();
+  if (!oauth) fail('OAuth is not configured (MCP_OWNER_PASSWORD / MCP_PUBLIC_URL).');
+  oauth.revokeAll();
+  console.error('All OAuth sign-ins revoked. Apps must sign in again.');
+  process.exit(0);
 }
 
 (stdio ? runStdio() : runHttp()).catch((error) => {

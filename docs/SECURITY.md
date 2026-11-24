@@ -40,6 +40,7 @@ Human ─▶ MCP client (Claude, …) ─▶ [1] MCP server ─▶ [2] Mukai API
 | **Secret leakage** | API keys showing up in logs or prompts | Keys named like `apiKey`, `token`, `secret`, `password` and env `value`s are redacted in audit logs and confirmation prompts. Mukai never returns saved keys. |
 | **Path tricks / SSRF** | IDs such as `../settings/api`, or paths that leave the API | Rejected before any request is made. Requests only ever go to `MUKAI_API_URL`. |
 | **Network exposure of Mukai** | Mukai reachable from the internet | Put Mukai behind Cloudflare Zero Trust. The MCP server gets through with a revocable **service token** (`MUKAI_CF_ACCESS_CLIENT_ID/SECRET`), only ever sent over HTTPS (or to loopback), and never follows Access's login redirects. Or run the MCP server on the same machine and use localhost. |
+| **Stolen connector URL / token in logs** | A secret placed in a URL leaks through logs | The Claude app signs in with **OAuth**: discovery, registration, a login page with the owner password, PKCE, a 1-hour access token, and 30-day rotating refresh tokens stored only as hashes. Only `claude.ai`/`claude.com` (and localhost) callbacks can register. Reuse of an old refresh token revokes that sign-in, and changing the password signs everyone out. The login page can't be framed, runs no scripts, and locks out after 5 wrong passwords per IP. |
 | **Brute force / scanning** | Guessing the MCP token | 32+ character minimum and lockout. Run it behind HTTPS (a token is a password). |
 
 Every tool call is written to stderr as a JSON audit line: time, session, tool, redacted
@@ -162,7 +163,10 @@ the mode and rules) come back to it rather than prompting the human.
 | `MCP_ENABLED_TOOLS` / `MCP_DISABLED_TOOLS` | — | Comma-separated allow/deny list of tool names |
 | `MCP_CONFIRM_TIMEOUT_SECONDS` | `600` | How long a prompt waits for the human |
 | `MCP_AUTH_MAX_FAILURES` | `10` | Failed attempts per IP per 10 minutes before lockout |
-| `MCP_ALLOW_QUERY_TOKEN` | `false` | Accept `?token=` for clients that can't send headers |
+| `MCP_PUBLIC_URL` / `MCP_OWNER_PASSWORD` | — | Turn on OAuth sign-in: the public HTTPS address of this server, and the owner password (12+ characters) |
+| `MCP_OAUTH_REDIRECT_HOSTS` | `claude.ai,claude.com` | Hosts allowed as OAuth callbacks (localhost always allowed) |
+| `MCP_OAUTH_STATE_FILE` | `data/oauth.json` | Registered apps and hashed tokens. Keep it on the persistent volume. |
+| `MCP_ALLOW_QUERY_TOKEN` | `false` | Accept `?token=` as a last resort for clients that can do neither OAuth nor headers |
 | `MCP_TRUST_PROXY` | `false` | Set `true` behind a reverse proxy so lockout uses the real client IP |
 | `MCP_SESSION_TTL_MINUTES` / `MCP_MAX_SESSIONS` | `60` / `50` | Idle session expiry and session cap |
 | `MCP_MAX_BODY` | `20mb` | Request body limit |
