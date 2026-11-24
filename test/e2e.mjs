@@ -321,7 +321,7 @@ await test('full-access: bot questions still go to the human (prompt), and are r
   const noPrompts = await connect(null);
   const refused = await noPrompts.call('mukai_decide_approval', { approvalId: item.id, answer: 'Green' });
   assert.equal(refused.isError, true);
-  assert.match(refused.text, /always need the human/);
+  assert.match(refused.text, /human must decide/);
   const answered = await human.call('mukai_decide_approval', { approvalId: item.id, answer: 'Green' });
   assert.equal(answered.json.decision, 'answered: Blue');
   assert.match((await reply).content, /Blue/);
@@ -341,6 +341,89 @@ await test('switching back to ask-for-approval needs no confirmation and takes e
   assert.equal(prompts.length, 1);
   assert.equal((await reply).status, 'complete');
   await client.close();
+});
+
+console.log('"I own it" mode and custom rules');
+
+await test('i-own-it: switching needs confirmation; then the AI answers app questions and yes/no itself, with no prompt', async () => {
+  const { client, call, prompts } = await connect(() => ({ action: 'accept', content: { confirm: true } }));
+  const set = await call('mukai_set_mcp_approval_mode', { workspaceId: workspace.id, mode: 'i-own-it' });
+  assert.equal(set.json.mcpApprovalMode, 'i-own-it', set.text);
+  assert.equal(prompts.length, 1);
+  const question = uiChat('ASKQ please');
+  const q = (await waitForPending(call, 'question')).item;
+  assert.equal(q.decidedBy, 'ai');
+  const answered = await call('mukai_decide_approval', { approvalId: q.id, answer: 'Green' });
+  assert.equal(answered.json.decision, 'answered: Green', answered.text);
+  assert.match((await question).content, /Green/);
+  const yesNo = uiChat('ASKOK please');
+  const y = (await waitForPending(call, 'yes_no')).item;
+  assert.equal(y.decidedBy, 'ai');
+  await call('mukai_decide_approval', { approvalId: y.id, approved: true });
+  assert.equal((await yesNo).status, 'complete');
+  assert.equal(prompts.length, 1); // nothing else was asked of the human
+  await client.close();
+});
+
+await test('rule tightens i-own-it without confirmation: requests.files-write = ask → file writes go back to the human', async () => {
+  const { client, call, prompts } = await connect(() => ({ action: 'accept', content: { decision: 'approve' } }));
+  const rule = await call('mukai_set_mcp_rule', { workspaceId: workspace.id, kind: 'requests', category: 'files-write', decision: 'ask' });
+  assert.equal(rule.json.decision, 'ask', rule.text);
+  assert.equal(prompts.length, 0);
+  const reply = uiChat('WRITEFILE rule-ask.txt');
+  const { item } = await waitForPending(call, 'tool');
+  assert.equal(item.decidedBy, 'human');
+  assert.equal(item.category, 'files-write');
+  assert.match(item.because, /your rule/);
+  await call('mukai_decide_approval', { approvalId: item.id, approved: true }); // the human approves in the prompt
+  assert.equal(prompts.length, 1);
+  assert.equal((await reply).status, 'complete');
+  const view = await call('mukai_get_mcp_permissions', { workspaceId: workspace.id });
+  assert.equal(view.json.mcpMode.mode, 'i-own-it');
+  assert.equal(view.json.requests.find((r) => r.category === 'files-write').decision, 'ask');
+  assert.equal(view.json.requests.find((r) => r.category === 'questions').decision, 'allow');
+  await call('mukai_set_mcp_rule', { workspaceId: workspace.id, kind: 'requests', category: 'files-write', decision: 'default' });
+  await client.close();
+});
+
+await test('rule loosening needs confirmation: declined → unchanged; accepted → the AI decides', async () => {
+  let ok = false;
+  const { client, call, prompts } = await connect(() => ({ action: 'accept', content: { confirm: ok } }));
+  await call('mukai_set_mcp_approval_mode', { workspaceId: workspace.id, mode: 'ask-for-approval' }); // stricter: no prompt
+  assert.equal(prompts.length, 0);
+  const denied = await call('mukai_set_mcp_rule', { workspaceId: workspace.id, kind: 'requests', category: 'files-write', decision: 'allow' });
+  assert.equal(denied.isError, true);
+  let view = await call('mukai_get_mcp_permissions', { workspaceId: workspace.id });
+  assert.equal(view.json.requests.find((r) => r.category === 'files-write').decision, 'ask');
+  ok = true;
+  const allowed = await call('mukai_set_mcp_rule', { workspaceId: workspace.id, kind: 'requests', category: 'files-write', decision: 'allow' });
+  assert.equal(allowed.json.decision, 'allow', allowed.text);
+  const reply = uiChat('WRITEFILE rule-allow.txt');
+  const { item } = await waitForPending(call, 'tool');
+  assert.equal(item.decidedBy, 'ai');
+  await call('mukai_decide_approval', { approvalId: item.id, approved: true });
+  assert.equal((await reply).status, 'complete');
+  view = await call('mukai_get_mcp_permissions', { workspaceId: workspace.id });
+  assert.equal(view.json.requests.find((r) => r.category === 'questions').decision, 'ask'); // mode is ask-for-approval
+  await call('mukai_set_mcp_rule', { workspaceId: workspace.id, kind: 'requests', category: 'files-write', decision: 'default' });
+  await client.close();
+});
+
+await test('action rule: actions.delete = allow lets the AI delete a bot in this workspace without asking', async () => {
+  const human = await connect(() => ({ action: 'accept', content: { confirm: true } }));
+  const spare = must(await mukai('POST', '/bots', {
+    workspaceId: workspace.id, name: 'Spare', role: 'Helper', instructions: 'x', providerId: provider.id, model: 'mock-1', supportsImages: null, avatar: 'mukai-logo',
+  }), 'spare bot');
+  await human.call('mukai_set_mcp_rule', { workspaceId: workspace.id, kind: 'actions', category: 'delete', decision: 'allow' });
+  const noPrompts = await connect(null); // proves no confirmation was needed
+  const r = await noPrompts.call('mukai_delete_bot', { botId: spare.id });
+  assert.equal(r.isError, false, r.text);
+  assert.equal((await mukai('GET', `/bots?workspaceId=${workspace.id}`)).some((b) => b.id === spare.id), false);
+  await human.call('mukai_set_mcp_rule', { workspaceId: workspace.id, kind: 'actions', category: 'delete', decision: 'default' });
+  const again = await noPrompts.call('mukai_delete_bot', { botId: bot.id });
+  assert.equal(again.isError, true); // back to asking
+  await noPrompts.client.close();
+  await human.client.close();
 });
 
 console.log('Hardening');

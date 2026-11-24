@@ -16,9 +16,20 @@ import {
   redact,
   toolAllowed,
   type SecurityPolicy,
-  type ApprovalModes,
   type ToolMeta,
 } from './security.js';
+import {
+  ACTION_CATEGORIES,
+  APPROVAL_MODES,
+  MODE_RANK,
+  REQUEST_CATEGORIES,
+  classifyAction,
+  classifyRequest,
+  type ActionCategory,
+  type ApprovalMode,
+  type PermissionStore,
+  type RequestCategory,
+} from './rules.js';
 
 const MAX_INLINE_BYTES = 8 * 1024 * 1024;
 const MAX_TEXT_CHARS = 200_000;
@@ -26,7 +37,7 @@ const MAX_TEXT_CHARS = 200_000;
 export interface ToolOptions {
   chatWaitSeconds: number;
   policy: SecurityPolicy;
-  modes: ApprovalModes;
+  permissions: PermissionStore;
   sessionId?: () => string | undefined;
 }
 
@@ -243,17 +254,31 @@ async function humanDecides(
 // ---- Registration -------------------------------------------------------------
 
 export function registerTools(server: McpServer, client: MukaiClient, options: ToolOptions) {
-  const { policy } = options;
+  const { policy, permissions } = options;
+
+  /** The workspace an action belongs to, for per-workspace action rules. */
+  const actionWorkspace = async (args: any): Promise<string | undefined> => {
+    if (typeof args?.workspaceId === 'string') return args.workspaceId;
+    if (typeof args?.botId === 'string') {
+      const workspaces = (await client.json<{ id: string }[]>('GET', '/workspaces').catch(() => [])) || [];
+      for (const workspace of workspaces) {
+        const bots = await client.json<{ id: string }[]>('GET', '/bots', { query: { workspaceId: workspace.id } }).catch(() => []);
+        if ((bots || []).some((bot) => String(bot.id) === args.botId)) return workspace.id;
+      }
+    }
+    return undefined; // falls back to the all-workspaces rules
+  };
 
   /** Single choke point: policy filter, human confirmation, audit log. */
   const secure = (
     name: string,
     config: { description: string; inputSchema: ZodRawShape },
-    meta: ToolMeta & { sensitiveWhen?: (args: any) => boolean },
+    meta: ToolMeta,
     handler: Handler,
   ) => {
     if (!toolAllowed(policy, name, meta)) return;
-    const flags = [meta.sensitive && policy.sensitive === 'confirm' ? 'Requires human confirmation.' : '', meta.destructive ? 'Destructive.' : '']
+    const governed = classifyAction(name, {}, meta.destructive) ?? (name === 'mukai_api_request' ? 'raw-api' : undefined);
+    const flags = [governed ? `Governed by MCP action rule "${governed}" (may need human confirmation).` : '', meta.destructive ? 'Destructive.' : '']
       .filter(Boolean)
       .join(' ');
     server.registerTool(
@@ -267,14 +292,18 @@ export function registerTools(server: McpServer, client: MukaiClient, options: T
         const started = Date.now();
         const base = { session: options.sessionId?.(), tool: name, args: redact(args) };
         try {
-          const sensitive = meta.sensitive || meta.sensitiveWhen?.(args) === true;
-          if (sensitive && policy.sensitive === 'confirm') {
-            const summary = JSON.stringify(redact(args), null, 2);
-            const allowed = await confirmSensitive(server, extra.requestId, policy, name, summary);
-            if (!allowed) {
-              audit({ ...base, outcome: 'declined_by_human' });
-              return failure(new Error('A human declined (or did not confirm) this action. Do not retry it unless they ask.'));
-            }
+          const category = classifyAction(name, args, meta.destructive);
+          if (category) {
+            const workspaceId = await actionWorkspace(args);
+            const rule = permissions.action(workspaceId, category);
+            if (rule.decision === 'ask') {
+              const summary = `Rule: actions.${category} = ask (${rule.source})\n` + JSON.stringify(redact(args), null, 2);
+              const allowed = await confirmSensitive(server, extra.requestId, policy, name, summary);
+              if (!allowed) {
+                audit({ ...base, outcome: 'declined_by_human', rule: category });
+                return failure(new Error('A human declined (or did not confirm) this action. Do not retry it unless they ask.'));
+              }
+            } else audit({ ...base, event: 'action.allowed_by_rule', rule: category, source: rule.source });
           }
           const result = await handler(args, extra);
           audit({ ...base, outcome: result.isError ? 'error' : 'ok', ms: Date.now() - started });
@@ -303,8 +332,6 @@ export function registerTools(server: McpServer, client: MukaiClient, options: T
         readOnly: endpoint.method === 'GET',
         destructive: endpoint.destructive ?? false,
         sensitive: SENSITIVE_TOOLS.has(endpoint.name) || (endpoint.destructive ?? false),
-        // Turning off human approval in Mukai is itself sensitive.
-        sensitiveWhen: endpoint.name === 'mukai_set_approval_mode' ? (args) => args?.mode === 'full-access' : undefined,
       },
       async (args) => {
         const request = buildRequest(endpoint, args || {});
@@ -316,19 +343,21 @@ export function registerTools(server: McpServer, client: MukaiClient, options: T
   }
 
   // ---- Who decides? -----------------------------------------------------------
-  // Mirrors Mukai: in a workspace whose MCP approval mode is full-access, the AI may decide
-  // TOOL approvals. Bot questions and yes/no go-aheads always go to the human, in every mode,
-  // just as Mukai keeps explicit questions waiting for the user even in Full access.
-  const { modes } = options;
-  const aiMayDecide = (item: PendingApproval) => approvalKind(item) === 'tool' && modes.get(item.workspaceId) === 'full-access';
-  const decidedBy = (item: PendingApproval) => (aiMayDecide(item) ? 'ai' : 'human');
+  // The workspace's MCP mode sets the baseline and request rules adjust it per category:
+  // ask-for-approval -> the human decides everything; full-access -> the AI decides tool
+  // requests, questions stay with the human; i-own-it -> the AI decides everything.
+  const categoryOf = (item: PendingApproval) => classifyRequest(item);
+  const ruleFor = (item: PendingApproval) => permissions.request(item.workspaceId, categoryOf(item));
+  const aiMayDecide = (item: PendingApproval) => ruleFor(item).decision === 'allow';
   const describePending = (item: PendingApproval, names?: Map<string, string>) => ({
     id: item.id,
     kind: approvalKind(item),
-    decidedBy: decidedBy(item),
+    category: categoryOf(item),
+    decidedBy: aiMayDecide(item) ? 'ai' : 'human',
+    because: ruleFor(item).source,
     workspaceId: item.workspaceId,
     workspaceName: names?.get(item.workspaceId),
-    mcpApprovalMode: modes.get(item.workspaceId),
+    mcpApprovalMode: permissions.mode(item.workspaceId).mode,
     bot: item.botName ?? item.botId,
     conversation: item.target?.name,
     conversationId: item.conversationId,
@@ -341,48 +370,54 @@ export function registerTools(server: McpServer, client: MukaiClient, options: T
   });
 
   /** Applies a decision the AI made itself — only ever reached when aiMayDecide(item). */
-  const aiDecides = async (item: PendingApproval, approved: boolean, reason?: string) => {
-    const body = approved ? { approved: true } : { approved: false, ...(reason ? { reason } : {}) };
+  const aiDecides = async (item: PendingApproval, approved?: boolean, reason?: string, answer?: string) => {
+    const kind = approvalKind(item);
+    let body: Record<string, unknown>;
+    if (kind === 'question') {
+      if (!answer?.trim()) throw new Error('This is a bot question: provide answer (one of the options or your own text).');
+      body = { answer: answer.trim() };
+    } else {
+      if (approved === undefined) throw new Error('Provide approved=true or false.');
+      body = approved ? { approved: true } : { approved: false, ...(reason ? { reason } : {}) };
+    }
     try {
       await client.json('POST', `/approvals/${encodeURIComponent(item.id)}`, { query: { workspaceId: item.workspaceId }, body });
     } catch (error) {
       if (error instanceof MukaiApiError && error.status === 409)
-        return { id: item.id, kind: approvalKind(item), decided: true, decision: 'already decided elsewhere' };
+        return { id: item.id, kind, decided: true, decision: 'already decided elsewhere' };
       throw error;
     }
-    audit({ event: 'approval.ai_decided', approvalId: item.id, workspaceId: item.workspaceId, tool: item.toolName, approved, reason });
-    return { id: item.id, kind: approvalKind(item), decided: true, decidedBy: 'ai', decision: approved ? 'approve' : 'reject' };
+    const decision = kind === 'question' ? `answered: ${body.answer}` : approved ? 'approve' : 'reject';
+    audit({ event: 'approval.ai_decided', approvalId: item.id, workspaceId: item.workspaceId, category: categoryOf(item), decision, reason });
+    return { id: item.id, kind, decided: true, decidedBy: 'ai', decision };
   };
 
-  /** Routes one decision request according to the workspace mode and the request kind. */
+  /** Routes one decision request according to the workspace mode and rules. */
   const decide = async (item: PendingApproval, extra: Extra, approved?: boolean, reason?: string, answer?: string) => {
-    if (aiMayDecide(item)) {
-      if (approved === undefined) throw new Error('Provide approved=true or false for this tool approval.');
-      return aiDecides(item, approved, reason);
-    }
+    if (aiMayDecide(item)) return aiDecides(item, approved, reason, answer);
     const suggestion = answer ?? (approved === undefined ? undefined : approved ? 'approve' : `reject${reason ? ` (${reason})` : ''}`);
     try {
       return await humanDecides(server, client, options.policy, extra, item, suggestion);
     } catch (error) {
-      if (error instanceof ConfirmationUnavailable)
+      if (error instanceof ConfirmationUnavailable) {
+        const rule = ruleFor(item);
         throw new ConfirmationUnavailable(
-          (approvalKind(item) === 'tool'
-            ? `This workspace's MCP approval mode is "${modes.get(item.workspaceId)}", so the human must decide this tool approval.`
-            : 'Bot questions and yes/no go-aheads always need the human, in every mode.') +
-            ' This client cannot show them a confirmation prompt; they can decide in Telegram or the Mukai app.',
+          `Under requests.${categoryOf(item)} = ask (${rule.source}) the human must decide this. ` +
+            'This client cannot show them a confirmation prompt; they can decide in Telegram or the Mukai app.',
         );
+      }
       throw error;
     }
   };
 
-  // ---- Everything waiting for the human, wherever it started ----
+  // ---- Everything waiting, wherever it started ----
   secure(
     'mukai_list_pending_approvals',
     {
       description:
         'List EVERYTHING waiting for a decision across all workspaces: tool approvals, bot questions and yes/no requests — ' +
-        'whether they started in the Mukai app, Telegram, a pursuit, or this MCP server. Each item says decidedBy: ' +
-        '"ai" (you may decide it, workspace is in MCP full-access) or "human". Decide with mukai_decide_approval.',
+        'whether they started in the Mukai app, Telegram, a pursuit, or this MCP server. Each item says decidedBy ' +
+        '"ai" (you may decide it, under the workspace mode/rules) or "human", and why. Decide with mukai_decide_approval.',
       inputSchema: { workspaceId: z.string().optional().describe('Limit to one workspace') },
     },
     { readOnly: true, destructive: false, sensitive: false },
@@ -394,13 +429,60 @@ export function registerTools(server: McpServer, client: MukaiClient, options: T
     },
   );
 
-  // ---- MCP approval mode (per workspace, like Mukai's own) ----
+  // ---- Modes and rules ----
+  const scopeSchema = z
+    .string()
+    .min(1)
+    .describe('Workspace ID, or "*" for every workspace');
+  const checkScope = async (scope: string) => {
+    if (scope === '*') return;
+    const workspaces = (await client.json<{ id: string }[]>('GET', '/workspaces')) || [];
+    if (!workspaces.some((item) => item.id === scope)) throw new Error('Unknown workspace.');
+  };
+  /** Loosening needs the human; tightening never does. */
+  const confirmLoosening = async (extra: Extra, title: string, details: string) => {
+    if (policy.sensitive === 'disable') throw new Error('Loosening permissions through MCP is disabled on this server; the operator sets them in MCP_RULES_FILE.');
+    if (policy.sensitive === 'allow') return;
+    const allowed = await confirmSensitive(server, extra.requestId, policy, title, details);
+    if (!allowed) throw new Error('A human declined (or did not confirm) this change. Do not retry it unless they ask.');
+  };
+
+  secure(
+    'mukai_get_mcp_permissions',
+    {
+      description:
+        'Show the MCP permissions for a workspace: its mode (ask-for-approval / full-access / i-own-it), and for every category whether ' +
+        'the AI may decide bot requests ("requests") and may act without confirmation ("actions"), with where each setting comes from. ' +
+        "Also shows Mukai's own workspace mode. Omit workspaceId for the all-workspaces baseline.",
+      inputSchema: { workspaceId: z.string().optional() },
+    },
+    { readOnly: true, destructive: false, sensitive: false },
+    async ({ workspaceId }) => {
+      const mukai = workspaceId
+        ? await client.json<{ mode?: string }>('GET', '/approvals', { query: { workspaceId } }).catch(() => undefined)
+        : undefined;
+      const view = permissions.describe(workspaceId);
+      const flat = (entries: Record<string, { decision: string; source: string; locked: boolean }>, catalog: Record<string, string>) =>
+        Object.entries(entries).map(([category, rule]) => ({ category, meaning: catalog[category], ...rule }));
+      return text({
+        workspaceId: workspaceId ?? '* (all workspaces)',
+        mcpMode: view.mode,
+        mukaiApprovalMode: mukai?.mode,
+        requests: flat(view.requests, REQUEST_CATEGORIES),
+        actions: flat(view.actions, ACTION_CATEGORIES),
+        legend: {
+          requests: 'allow = the AI decides this kind of bot request; ask = the human decides',
+          actions: 'allow = the AI may do this without confirmation; ask = the human confirms first',
+          mukaiApprovalMode: 'Mukai’s own setting: whether bots ask at all (full-access there creates no approvals).',
+        },
+      });
+    },
+  );
+  // Kept for compatibility: summary of modes per workspace.
   secure(
     'mukai_get_mcp_approval_mode',
     {
-      description:
-        "Show the MCP approval mode per workspace (who decides tool approvals for requests seen through MCP), next to Mukai's own workspace mode. " +
-        'ask-for-approval: the human decides everything. full-access: the AI may decide tool approvals; questions still go to the human.',
+      description: 'Show the MCP approval mode of every workspace next to Mukai’s own mode. For per-category detail use mukai_get_mcp_permissions.',
       inputSchema: { workspaceId: z.string().optional() },
     },
     { readOnly: true, destructive: false, sensitive: false },
@@ -411,35 +493,81 @@ export function registerTools(server: McpServer, client: MukaiClient, options: T
       const rows = [];
       for (const workspace of workspaces) {
         const state = await client.json<{ mode?: string }>('GET', '/approvals', { query: { workspaceId: workspace.id } }).catch(() => undefined);
-        rows.push({ workspaceId: workspace.id, name: workspace.name, mcpApprovalMode: modes.get(workspace.id), mukaiApprovalMode: state?.mode });
+        rows.push({ workspaceId: workspace.id, name: workspace.name, mcpApprovalMode: permissions.mode(workspace.id).mode, mukaiApprovalMode: state?.mode });
       }
-      return text({
-        default: modes.all().default,
-        workspaces: rows,
-        note: 'Mukai’s own mode decides whether bots ask at all (full-access there means no approvals are created). The MCP mode decides who answers the approvals that are created.',
-      });
+      return text({ default: permissions.mode().mode, workspaces: rows });
     },
   );
   secure(
     'mukai_set_mcp_approval_mode',
     {
       description:
-        'Set the MCP approval mode for a workspace. Switching to full-access lets the AI decide tool approvals and needs human confirmation; ' +
-        'switching to ask-for-approval is always allowed. Switching never decides requests that are already waiting.',
+        'Set the MCP approval mode for a workspace (or "*" for all): ask-for-approval (human decides everything), full-access (AI decides ' +
+        'bot tool requests; questions stay with the human), i-own-it (AI decides everything, questions and yes/no included), or "default". ' +
+        'Making it more permissive needs human confirmation; making it stricter never does. Never decides requests already waiting.',
+      inputSchema: { workspaceId: scopeSchema, mode: z.enum([...APPROVAL_MODES, 'default']) },
+    },
+    { readOnly: false, destructive: false, sensitive: false },
+    async ({ workspaceId, mode }, extra) => {
+      await checkScope(workspaceId);
+      const scope = workspaceId === '*' ? undefined : workspaceId;
+      const before = permissions.mode(scope);
+      if (before.locked) throw new Error('The operator has locked the mode for this scope.');
+      const previous = permissions.runtimeRules()[workspaceId]?.mode;
+      permissions.setMode(workspaceId, mode);
+      const outcome = permissions.mode(scope).mode;
+      permissions.setMode(workspaceId, previous ?? 'default');
+      if (MODE_RANK[outcome] > MODE_RANK[before.mode])
+        await confirmLoosening(extra, 'mukai_set_mcp_approval_mode', `Workspace: ${workspaceId}\nMode: ${before.mode} → ${outcome}`);
+      permissions.setMode(workspaceId, mode);
+      const after = permissions.mode(scope);
+      audit({ event: 'approval_mode.changed', workspaceId, from: before.mode, to: after.mode });
+      return text({ workspaceId, mcpApprovalMode: after.mode, source: after.source });
+    },
+  );
+  secure(
+    'mukai_set_mcp_rule',
+    {
+      description:
+        'Add or change a permission rule. kind "requests": may the AI decide this kind of bot request (allow) or must the human (ask)? ' +
+        'kind "actions": may the AI do this itself without confirmation (allow) or must the human confirm (ask)? "default" removes the rule. ' +
+        'Use mukai_get_mcp_permissions to see categories. Loosening (→ allow) needs human confirmation; tightening never does.',
       inputSchema: {
-        workspaceId: z.string().min(1),
-        mode: z.enum(['ask-for-approval', 'full-access']),
+        workspaceId: scopeSchema,
+        kind: z.enum(['requests', 'actions']),
+        category: z.string().min(1).describe('A category name from mukai_get_mcp_permissions, e.g. "terminal" or "delete"'),
+        decision: z.enum(['allow', 'ask', 'default']),
       },
     },
-    { readOnly: false, destructive: false, sensitive: false, sensitiveWhen: (args) => args?.mode === 'full-access' },
-    async ({ workspaceId, mode }) => {
-      if (mode === 'full-access' && options.policy.sensitive === 'disable')
-        throw new Error('Sensitive changes are disabled on this server, so full-access can only be set by the operator (MCP_APPROVAL_MODE).');
-      const workspaces = (await client.json<{ id: string }[]>('GET', '/workspaces')) || [];
-      if (!workspaces.some((item) => item.id === workspaceId)) throw new Error('Unknown workspace.');
-      const saved = modes.set(workspaceId, mode);
-      audit({ event: 'approval_mode.changed', workspaceId, mode: saved });
-      return text({ workspaceId, mcpApprovalMode: saved });
+    { readOnly: false, destructive: false, sensitive: false },
+    async ({ workspaceId, kind, category, decision }, extra) => {
+      const catalog: Record<string, string> = kind === 'requests' ? REQUEST_CATEGORIES : ACTION_CATEGORIES;
+      if (!(category in catalog))
+        throw new Error(`Unknown ${kind} category "${category}". Valid: ${Object.keys(catalog).join(', ')}`);
+      await checkScope(workspaceId);
+      const scope = workspaceId === '*' ? undefined : workspaceId;
+      const read = () =>
+        kind === 'requests' ? permissions.request(scope, category as RequestCategory) : permissions.action(scope, category as ActionCategory);
+      const before = read();
+      if (before.locked) throw new Error(`The operator has locked ${kind}.${category} for this scope.`);
+      // Work out the outcome first so that "default" counts as loosening when the default is allow.
+      const previous = (permissions.runtimeRules()[workspaceId]?.[kind as "requests" | "actions"] as Record<string, string> | undefined)?.[category] as 'allow' | 'ask' | undefined;
+      // Work out the outcome (so "default" counts as loosening when the default is allow), then
+      // undo it while the human is asked, so a looser rule is never live before they confirm.
+      permissions.setRule(workspaceId, kind, category, decision);
+      const outcome = read();
+      permissions.setRule(workspaceId, kind, category, previous ?? 'default');
+      if (before.decision === 'ask' && outcome.decision === 'allow')
+        await confirmLoosening(
+          extra,
+          'mukai_set_mcp_rule',
+          `Workspace: ${workspaceId}\n${kind}.${category} (${catalog[category]}): ask → allow\n` +
+            (kind === 'requests' ? 'The AI would decide these bot requests for you.' : 'The AI could do this without asking you.'),
+        );
+      permissions.setRule(workspaceId, kind, category, decision);
+      const after = read();
+      audit({ event: 'rule.changed', workspaceId, kind, category, from: before.decision, to: after.decision });
+      return text({ workspaceId, kind, category, decision: after.decision, source: after.source });
     },
   );
 
@@ -512,7 +640,7 @@ export function registerTools(server: McpServer, client: MukaiClient, options: T
       const parts = [];
       if (forAi)
         parts.push(
-          `${forAi} tool approval(s) are yours to decide (workspace MCP mode is full-access): call mukai_decide_approval with approved=true/false.`,
+          `${forAi} request(s) are yours to decide (decidedBy "ai"): call mukai_decide_approval with approved=true/false, or answer=... for questions. Decide in the human's interest and give a reason when rejecting.`,
         );
       if (forHuman)
         parts.push(
@@ -717,7 +845,7 @@ export function registerTools(server: McpServer, client: MukaiClient, options: T
         body: z.any().optional(),
       },
     },
-    { readOnly: false, destructive: true, sensitive: false, sensitiveWhen: (args) => args?.method !== 'GET' },
+    { readOnly: false, destructive: true, sensitive: false },
     async ({ method, path, query, body }) => {
       const clean = '/' + String(path).replace(/^\/+/, '');
       if (method !== 'GET' && /^\/+approvals(\/|$)/i.test(clean))

@@ -16,7 +16,7 @@ MCP client ──(Streamable HTTP + bearer)──▶ mukai-mcp ──(Bearer api
 See **[docs/MUKAI_API.md](docs/MUKAI_API.md)** for every Mukai route and its tool, and
 **[docs/SECURITY.md](docs/SECURITY.md)** for the security model.
 
-## Tools (141 by default, 55 in read-only, 142 in full)
+## Tools (143 by default, 56 in read-only, 144 in full)
 
 | Area | Tools |
 | --- | --- |
@@ -24,7 +24,7 @@ See **[docs/MUKAI_API.md](docs/MUKAI_API.md)** for every Mukai route and its too
 | Workspaces | list, create, update, delete, timezone, VM computer status/start/stop/resources/setup |
 | Bots | list, create, `mukai_update_bot` (partial), replace, delete, set model, messages, files, artifacts, attachments, new private conversation |
 | Conversations / spaces | list (private / bot / history), create space, import, get, messages, outputs, terminal, trajectory, artifacts, saved, references, activity images, file changes |
-| Approvals | `mukai_list_pending_approvals` (everything waiting, from the app, Telegram, pursuits or MCP), approve/reject/answer, batch, Mukai's own mode, and the MCP approval mode per workspace (`mukai_get/set_mcp_approval_mode`) |
+| Approvals | `mukai_list_pending_approvals` (everything waiting, from the app, Telegram, pursuits or MCP), approve/reject/answer, batch, Mukai's own mode, and MCP permissions: modes and rules per workspace (`mukai_get_mcp_permissions`, `mukai_set_mcp_approval_mode`, `mukai_set_mcp_rule`) |
 | Providers | list, create, update, delete, test, models, ChatGPT sign-in/disconnect |
 | Pursuits | list, get, delete, pause/resume, run now, run detail, retry, workpad |
 | Memory | snapshot, search, context, fact get/correct/forget, episodes, settings, embeddings, import/export, consolidate, clear |
@@ -43,9 +43,18 @@ Mukai streams chat replies. The chat tools read that stream and return the final
 activity, and any pending approvals in one result. Mukai runs live on the backend:
 disconnecting never cancels a run, and sending the same `requestId` again reattaches to it.
 
-When a bot needs approval, the MCP follows **the same two modes as Mukai**, per workspace:
-**ask-for-approval** (the default: you decide everything) or **full-access** (the AI may
-decide tool approvals). In both modes, bot questions and yes/no go-aheads always come to you.
+When a bot needs approval, a **mode** per workspace decides who answers, and **rules** can
+adjust it per category:
+- **ask-for-approval** (the default): you decide everything.
+- **full-access** (like Mukai's): Claude decides bot tool requests; questions stay with you.
+- **i-own-it**: Claude decides everything, questions and yes/no included.
+
+Rules such as "never approve terminal commands for me" or "Claude may delete in my sandbox" can
+be set by you through Claude (loosening needs your confirmation) or by the operator in a
+lockable rules file. Sensitive actions Claude takes itself (deleting, providers, custom code…)
+need your confirmation in every mode unless a rule allows them. See
+[docs/SECURITY.md](docs/SECURITY.md#two-kinds-of-permission).
+
 In ask-for-approval:
 - In clients that support MCP elicitation (confirmation prompts), the human gets a prompt built
   from Mukai's own record of the request. Their choice is applied and the tool waits for the
@@ -165,6 +174,8 @@ MUKAI_API_URL=http://127.0.0.1:47831 MUKAI_API_TOKEN=... \
 MCP_URL=http://127.0.0.1:3333/mcp MCP_AUTH_TOKEN=... TEST_FOLDER=/tmp/empty-dir \
 node test/e2e.mjs
 ```
+
+Unit tests for the permission rules (no backend needed): `npm test`.
 
 Run `node scripts/gen-api-doc.mjs` after changing `src/endpoints.ts` to regenerate the API
 inventory.

@@ -1,6 +1,6 @@
 {
   "name": "mukai-mcp",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "MCP server exposing the Mukai backend HTTP API as tools.",
   "type": "module",
   "private": true,
@@ -15,7 +15,9 @@
     "start": "node dist/index.js",
     "start:stdio": "node dist/index.js --stdio",
     "dev": "tsx src/index.ts",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "npm run build && node --test test/rules.test.mjs",
+    "test:e2e": "node test/e2e.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.32.2",

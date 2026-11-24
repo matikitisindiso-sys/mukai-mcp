@@ -59,30 +59,72 @@ and `mukai_decide_approval` answers it. The app gets the answer exactly as if yo
 there. In the other direction, a request raised by a run that MCP started shows up in Telegram
 and the app as usual.
 
-### MCP approval modes
+### Two kinds of permission
 
-The MCP server uses **the same two modes as Mukai**, also set **per workspace**. They control
-who decides the requests that reach the MCP:
+Claude, or any AI connected through the MCP, gets things done in two ways, and each has its
+own permissions:
 
-| MCP mode | Tool approvals (write a file, run a command…) | Bot questions and yes/no go-aheads |
-| --- | --- | --- |
-| **ask-for-approval** *(default)* | The human decides: confirmation prompt, Telegram or the app. The AI can't. | The human |
-| **full-access** | The AI connected through MCP may approve or reject them itself | **Still the human**, as in Mukai |
+1. **Bot requests (`requests`).** Claude asks a Mukai bot to do something ("open the browser
+   and look this up"). The bot uses its own tools, and Mukai creates approvals for them. The
+   question is: **may Claude decide these approvals for you?**
+2. **Claude's own actions (`actions`).** Claude calls Mukai directly through MCP tools, for
+   example to delete a bot, add a provider or click in an open browser tab. Mukai treats these
+   as you, the owner, and asks nobody. So the MCP's action rules are the **only** gate here.
+   The question is: **may Claude do this without your confirmation?**
 
-- Every pending item says `decidedBy: "ai"` or `"human"`, so the assistant knows which ones are
-  its to decide.
-- `mukai_get_mcp_approval_mode` shows each workspace's MCP mode next to Mukai's own mode.
-  `mukai_set_mcp_approval_mode` changes it. Switching **to** full-access needs the human's
-  confirmation; switching back is always allowed. Switching never decides requests that are
-  already waiting.
-- `MCP_APPROVAL_MODE` sets the default for workspaces without their own setting. Per-workspace
-  choices are saved in `MCP_STATE_FILE`. If that file is lost, every workspace falls back to the
-  default, so put it on a persistent volume.
-- Decisions the AI makes in full-access are written to the audit log (`approval.ai_decided`).
-- **Two layers.** Mukai's own mode decides whether bots ask at all; in Mukai full-access no
-  approvals are created, so there is nothing for the MCP to decide. The MCP mode decides who
-  answers the approvals Mukai does create. For approvals to happen at all, keep Mukai
-  workspaces on ask-for-approval.
+### Modes (the baseline, per workspace)
+
+| Mode | Bot tool requests (files, terminal, browser…) | Bot questions and yes/no go-aheads | Claude's sensitive actions |
+| --- | --- | --- | --- |
+| **ask-for-approval** *(default)* | You decide | You decide | You confirm |
+| **full-access** (like Mukai's) | Claude decides | You decide | You confirm |
+| **i-own-it** | Claude decides | Claude decides | You confirm |
+
+Direct browser control (`browser-control`) follows the mode: you confirm it in
+ask-for-approval, and Claude may do it in the other two modes.
+
+### Rules (adjust the baseline per category)
+
+Rules say `allow` or `ask` for one category and override the mode:
+
+| `requests` categories (bot requests) | `actions` categories (Claude's own) |
+| --- | --- |
+| `files-read`, `files-write` (new files, partial edits), `files-overwrite` (replace a whole file), `terminal` (commands, processes, code), `browser`, `computer-use`, `web`, `bots`, `pursuits`, `custom-code`, `custom-tools`, `other`, `questions`, `yes-no` | `delete`, `providers`, `custom-code` (register/enable custom tools, routes, jobs), `secrets`, `skills`, `memory-edit`, `workspace-setup`, `telegram`, `settings`, `browser-control`, `raw-api` |
+
+Examples:
+- *"I own it, but never approve terminal commands for me"*: `requests.terminal = ask`.
+- *"In my sandbox workspace, Claude may delete things"*: `actions.delete = allow`.
+
+Rules can be set for **one workspace** or for **all workspaces** (`"*"`). If both exist, the
+workspace rule wins.
+
+**Who sets rules and modes:**
+- **You, by asking Claude.** Claude uses `mukai_set_mcp_approval_mode` and `mukai_set_mcp_rule`.
+  Anything that **loosens** permissions (towards `allow` or a more permissive mode) shows you a
+  confirmation first, and the looser setting isn't live until you confirm. **Tightening never
+  asks.** These settings are saved in `MCP_STATE_FILE`.
+- **The operator, before deploying.** Write a JSON file and point `MCP_RULES_FILE` at it; see
+  `rules.example.json`. The operator can **lock** entries (`"locked": ["requests.terminal",
+  "actions.*", "mode", "*"]`), and locked entries can't be changed through the MCP at all.
+
+**Precedence** (first match wins):
+1. Operator lock (this workspace)
+2. Operator lock (all workspaces)
+3. Your rule (this workspace)
+4. Your rule (all workspaces)
+5. Operator rule (this workspace)
+6. Operator rule (all workspaces)
+7. The mode's default
+
+To see the effective setting for every category, and where it comes from, ask Claude to run
+`mukai_get_mcp_permissions`. Every pending request says `decidedBy: "ai"` or `"human"` and
+`because: …`. Every decision Claude makes alone is written to the audit log
+(`approval.ai_decided`, `action.allowed_by_rule`), and so is every rule change (`rule.changed`).
+
+**Two layers.** Mukai's own workspace mode decides whether bots ask at all; in Mukai
+full-access no approvals are created, so there's nothing for the MCP to decide. Keep Mukai
+workspaces on ask-for-approval if you want approvals to happen at all, and use the MCP modes
+and rules to choose who answers them.
 
 When a bot run that the MCP started needs approval:
 
@@ -94,17 +136,18 @@ When a bot run that the MCP started needs approval:
 
 In every case the result lists what is pending and who decides each item, and tells the model
 not to decide the human's ones. If the client has no elicitation support, the human's items
-are refused through MCP and the human decides in Telegram or the app. In full-access mode the
-AI's own items come back to it rather than prompting the human.
+are refused through MCP and the human decides in Telegram or the app. Items Claude may decide (under
+the mode and rules) come back to it rather than prompting the human.
 
 ## Configuration
 
 | Variable | Default | Options |
 | --- | --- | --- |
-| `MCP_APPROVAL_MODE` | `ask-for-approval` | Default MCP mode for workspaces: `ask-for-approval` or `full-access`. Per-workspace changes go through `mukai_set_mcp_approval_mode`. |
-| `MCP_STATE_FILE` | `data/mcp-state.json` | Where per-workspace MCP modes are saved. Use a persistent volume. |
-| `MCP_SENSITIVE_TOOLS` | `confirm` | `confirm`: needs a human prompt, refused if the client can't show one. `disable`: tools hidden. `allow`: no confirmation. |
-| `MCP_TOOL_PROFILE` | `standard` | `read-only` (55 tools, nothing that changes state), `standard` (141), `full` (142, adds the raw API tool) |
+| `MCP_APPROVAL_MODE` | `ask-for-approval` | Default MCP mode: `ask-for-approval`, `full-access` or `i-own-it` |
+| `MCP_RULES_FILE` | — | Operator rules file (JSON, can lock entries). See `rules.example.json`. |
+| `MCP_STATE_FILE` | `data/mcp-state.json` | Where modes and rules set through the MCP are saved. Use a persistent volume. |
+| `MCP_SENSITIVE_TOOLS` | `confirm` | Baseline for sensitive actions. `confirm`: ask, refused if the client can't show a prompt. `disable`: sensitive tools hidden and permissions can't be loosened through MCP. `allow`: no confirmation. |
+| `MCP_TOOL_PROFILE` | `standard` | `read-only` (56 tools, nothing that changes state), `standard` (143), `full` (144, adds the raw API tool) |
 | `MCP_ENABLE_RAW_API` | `false` | Expose `mukai_api_request`. Its non-GET calls still need confirmation. |
 | `MCP_ENABLED_TOOLS` / `MCP_DISABLED_TOOLS` | — | Comma-separated allow/deny list of tool names |
 | `MCP_CONFIRM_TIMEOUT_SECONDS` | `600` | How long a prompt waits for the human |

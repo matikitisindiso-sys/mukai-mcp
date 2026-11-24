@@ -1,0 +1,14 @@
+{
+  "workspaces": {
+    "*": {
+      "mode": "ask-for-approval",
+      "requests": { "terminal": "ask", "files-overwrite": "ask" },
+      "actions": { "delete": "ask", "providers": "ask" },
+      "locked": ["requests.terminal", "actions.providers"]
+    },
+    "REPLACE-WITH-SANDBOX-WORKSPACE-ID": {
+      "mode": "i-own-it",
+      "actions": { "delete": "allow", "custom-code": "allow" }
+    }
+  }
+}
