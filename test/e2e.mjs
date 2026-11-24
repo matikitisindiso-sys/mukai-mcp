@@ -113,7 +113,8 @@ await test('human dismisses the prompt → still pending; model "approve" is onl
   const first = await call('mukai_chat_with_bot', { botId: bot.id, text: 'WRITEFILE later.txt' });
   assert.equal(first.json.status, 'awaiting_approval', first.text);
   assert.equal(first.json.pendingApprovals.length, 1);
-  assert.match(first.json.hint, /human must decide/);
+  assert.match(first.json.hint, /need the human/);
+  assert.equal(first.json.pendingApprovals[0].decidedBy, 'human');
   const approval = first.json.pendingApprovals[0];
 
   // The model tries to approve; the human declines again → nothing is approved.
@@ -166,11 +167,11 @@ await test('pending approval is reported; the model cannot approve it; human app
   const first = await call('mukai_chat_with_bot', { botId: bot.id, text: 'WRITEFILE elsewhere.txt' });
   assert.equal(first.json.status, 'awaiting_approval', first.text);
   const approval = first.json.pendingApprovals[0];
-  assert.equal(approval.toolName, 'file_operations');
+  assert.equal(approval.tool, 'file_operations');
 
   const tried = await call('mukai_decide_approval', { workspaceId: approval.workspaceId, approvalId: approval.id, approved: true });
   assert.equal(tried.isError, true);
-  assert.match(tried.text, /needs a human/);
+  assert.match(tried.text, /human must decide/);
   assert.equal(existsSync(file('elsewhere.txt')), false);
 
   // Re-attach in "wait" mode; meanwhile the human approves from the app/Telegram (same Mukai API).
@@ -269,31 +270,78 @@ await test('tool approval raised in the app → approved via MCP → tool runs',
   await client.close();
 });
 
-if (process.env.MCP_URL_MODEL_POLICY) {
-  await test('with MCP_APPROVAL_POLICY=model the assistant can approve directly (no prompt support needed)', async () => {
-    const saved = process.env.MCP_URL;
-    const { Client: C } = await import('@modelcontextprotocol/sdk/client/index.js');
-    const c = new C({ name: 'e2e-model', version: '1' });
-    await c.connect(
-      new StreamableHTTPClientTransport(new URL(process.env.MCP_URL_MODEL_POLICY), {
-        requestInit: { headers: { Authorization: `Bearer ${MCP_AUTH_TOKEN}` } },
-      }),
-    );
-    const reply = uiChat('WRITEFILE model-policy.txt');
-    let item;
-    for (let i = 0; i < 50 && !item; i++) {
-      const r = await c.callTool({ name: 'mukai_list_pending_approvals', arguments: {} });
-      item = JSON.parse(r.content[0].text.replace(/^\[Mukai data[^\]]*\]\n/, '')).pending.find((p) => p.kind === 'tool');
-      if (!item) await new Promise((r) => setTimeout(r, 200));
-    }
-    const r = await c.callTool({ name: 'mukai_decide_approval', arguments: { approvalId: item.id, workspaceId: item.workspaceId, approved: true } });
-    assert.equal(!!r.isError, false, r.content[0].text);
-    assert.equal((await reply).status, 'complete');
-    assert.ok(existsSync(file('model-policy.txt')));
-    await c.close();
-    process.env.MCP_URL = saved;
-  });
-}
+console.log('MCP approval modes (mirroring Mukai: ask-for-approval / full-access)');
+
+await test('switching a workspace to MCP full-access needs the human; declined → stays ask-for-approval', async () => {
+  const { client, call, prompts } = await connect(() => ({ action: 'accept', content: { confirm: false } }));
+  const r = await call('mukai_set_mcp_approval_mode', { workspaceId: workspace.id, mode: 'full-access' });
+  assert.equal(r.isError, true);
+  assert.equal(prompts.length, 1);
+  const modes = await call('mukai_get_mcp_approval_mode', { workspaceId: workspace.id });
+  assert.equal(modes.json.workspaces[0].mcpApprovalMode, 'ask-for-approval');
+  assert.equal(modes.json.workspaces[0].mukaiApprovalMode, 'ask-for-approval');
+  await client.close();
+});
+
+await test('full-access: tool approval raised in the app → marked decidedBy "ai" → AI approves with no prompt → tool runs', async () => {
+  const { client, call, prompts } = await connect(() => ({ action: 'accept', content: { confirm: true } }));
+  const set = await call('mukai_set_mcp_approval_mode', { workspaceId: workspace.id, mode: 'full-access' });
+  assert.equal(set.json.mcpApprovalMode, 'full-access', set.text);
+  const confirmations = prompts.length;
+  const reply = uiChat('WRITEFILE ai-approved.txt');
+  const { item } = await waitForPending(call, 'tool');
+  assert.equal(item.decidedBy, 'ai');
+  const decided = await call('mukai_decide_approval', { approvalId: item.id, approved: true });
+  assert.equal(decided.json.decidedBy, 'ai', decided.text);
+  assert.equal(prompts.length, confirmations); // no prompt to the human
+  assert.equal((await reply).status, 'complete');
+  assert.ok(existsSync(file('ai-approved.txt')));
+  await client.close();
+});
+
+await test('full-access: chat started via MCP returns the tool approval to the AI instead of prompting', async () => {
+  const { client, call, prompts } = await connect(() => ({ action: 'accept', content: { decision: 'approve' } }));
+  const first = await call('mukai_chat_with_bot', { botId: bot.id, text: 'WRITEFILE ai-chat.txt' });
+  assert.equal(first.json.status, 'awaiting_approval', first.text);
+  assert.equal(first.json.pendingApprovals[0].decidedBy, 'ai');
+  assert.match(first.json.hint, /yours to decide/);
+  assert.equal(prompts.length, 0);
+  await call('mukai_decide_approval', { approvalId: first.json.pendingApprovals[0].id, approved: false, reason: 'not needed' });
+  const rest = await call('mukai_chat_with_bot', { botId: bot.id, text: 'WRITEFILE ai-chat.txt', requestId: first.json.requestId });
+  assert.equal(rest.json.status, 'done', rest.text);
+  assert.equal(existsSync(file('ai-chat.txt')), false);
+  await client.close();
+});
+
+await test('full-access: bot questions still go to the human (prompt), and are refused without prompt support', async () => {
+  const human = await connect(() => ({ action: 'accept', content: { choice: 'Blue' } }));
+  const reply = uiChat('ASKQ please');
+  const { item } = await waitForPending(human.call, 'question');
+  assert.equal(item.decidedBy, 'human');
+  const noPrompts = await connect(null);
+  const refused = await noPrompts.call('mukai_decide_approval', { approvalId: item.id, answer: 'Green' });
+  assert.equal(refused.isError, true);
+  assert.match(refused.text, /always need the human/);
+  const answered = await human.call('mukai_decide_approval', { approvalId: item.id, answer: 'Green' });
+  assert.equal(answered.json.decision, 'answered: Blue');
+  assert.match((await reply).content, /Blue/);
+  await noPrompts.client.close();
+  await human.client.close();
+});
+
+await test('switching back to ask-for-approval needs no confirmation and takes effect immediately', async () => {
+  const { client, call, prompts } = await connect(() => ({ action: 'accept', content: { decision: 'approve' } }));
+  const r = await call('mukai_set_mcp_approval_mode', { workspaceId: workspace.id, mode: 'ask-for-approval' });
+  assert.equal(r.json.mcpApprovalMode, 'ask-for-approval');
+  assert.equal(prompts.length, 0);
+  const reply = uiChat('WRITEFILE back-to-ask.txt');
+  const { item } = await waitForPending(call, 'tool');
+  assert.equal(item.decidedBy, 'human');
+  await call('mukai_decide_approval', { approvalId: item.id, approved: true }); // human approves in the prompt
+  assert.equal(prompts.length, 1);
+  assert.equal((await reply).status, 'complete');
+  await client.close();
+});
 
 console.log('Hardening');
 

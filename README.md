@@ -16,7 +16,7 @@ MCP client ──(Streamable HTTP + bearer)──▶ mukai-mcp ──(Bearer api
 See **[docs/MUKAI_API.md](docs/MUKAI_API.md)** for every Mukai route and its tool, and
 **[docs/SECURITY.md](docs/SECURITY.md)** for the security model.
 
-## Tools (139 by default, 54 in read-only, 140 in full)
+## Tools (141 by default, 55 in read-only, 142 in full)
 
 | Area | Tools |
 | --- | --- |
@@ -24,7 +24,7 @@ See **[docs/MUKAI_API.md](docs/MUKAI_API.md)** for every Mukai route and its too
 | Workspaces | list, create, update, delete, timezone, VM computer status/start/stop/resources/setup |
 | Bots | list, create, `mukai_update_bot` (partial), replace, delete, set model, messages, files, artifacts, attachments, new private conversation |
 | Conversations / spaces | list (private / bot / history), create space, import, get, messages, outputs, terminal, trajectory, artifacts, saved, references, activity images, file changes |
-| Approvals | `mukai_list_pending_approvals` (everything waiting, from the app, Telegram, pursuits or MCP), set mode, approve/reject/answer questions, batch |
+| Approvals | `mukai_list_pending_approvals` (everything waiting, from the app, Telegram, pursuits or MCP), approve/reject/answer, batch, Mukai's own mode, and the MCP approval mode per workspace (`mukai_get/set_mcp_approval_mode`) |
 | Providers | list, create, update, delete, test, models, ChatGPT sign-in/disconnect |
 | Pursuits | list, get, delete, pause/resume, run now, run detail, retry, workpad |
 | Memory | snapshot, search, context, fact get/correct/forget, episodes, settings, embeddings, import/export, consolidate, clear |
@@ -43,7 +43,10 @@ Mukai streams chat replies. The chat tools read that stream and return the final
 activity, and any pending approvals in one result. Mukai runs live on the backend:
 disconnecting never cancels a run, and sending the same `requestId` again reattaches to it.
 
-When a bot needs approval, **the human decides, not the AI model**:
+When a bot needs approval, the MCP follows **the same two modes as Mukai**, per workspace:
+**ask-for-approval** (the default: you decide everything) or **full-access** (the AI may
+decide tool approvals). In both modes, bot questions and yes/no go-aheads always come to you.
+In ask-for-approval:
 - In clients that support MCP elicitation (confirmation prompts), the human gets a prompt built
   from Mukai's own record of the request. Their choice is applied and the tool waits for the
   rest of the reply.
@@ -77,7 +80,7 @@ cp .env.example .env   # then fill in values; export them or use your platform's
 | `PORT` / `HOST` | no | Listener address. Defaults to `3333` / `0.0.0.0`. |
 | `MCP_ALLOWED_HOSTS` | no | Comma-separated allowlist for the `Host` header, which protects against DNS rebinding, e.g. `mcp.example.com`. |
 | `MUKAI_CHAT_WAIT_SECONDS` | no | How long chat tools wait by default. Default `55`. Keep it below your client's tool timeout. |
-| `MCP_APPROVAL_POLICY`, `MCP_SENSITIVE_TOOLS`, `MCP_TOOL_PROFILE`, … | no | Security policy. Safe by default; see [docs/SECURITY.md](docs/SECURITY.md#configuration). |
+| `MCP_APPROVAL_MODE`, `MCP_SENSITIVE_TOOLS`, `MCP_TOOL_PROFILE`, … | no | Security policy. Safe by default; see [docs/SECURITY.md](docs/SECURITY.md#configuration). |
 
 ### Choosing `MUKAI_API_URL`
 

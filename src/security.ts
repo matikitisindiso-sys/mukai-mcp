@@ -1,3 +1,5 @@
+import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { dirname } from 'node:path';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { RequestId } from '@modelcontextprotocol/sdk/types.js';
 
@@ -7,12 +9,16 @@ import type { RequestId } from '@modelcontextprotocol/sdk/types.js';
  */
 export type ToolProfile = 'read-only' | 'standard' | 'full';
 /**
- * human      - approval decisions need a human to answer an MCP elicitation prompt in the
- *              client UI. The AI model can never approve on its own.
- * mukai-only - no approval tools at all; decide in the Mukai app or Telegram.
- * model      - the AI model may approve/reject directly (least safe).
+ * The MCP approval mode mirrors Mukai's own two workspace modes, applied to the AI
+ * connected through MCP:
+ * ask-for-approval - every approval goes to the human (confirmation prompt, Telegram or the
+ *                    Mukai app). The AI can never approve on its own.
+ * full-access      - the AI may approve/reject tool approvals itself.
+ * In BOTH modes, bot questions and yes/no go-aheads always go to the human, exactly as Mukai
+ * keeps explicit questions waiting for the user even in Full access.
  */
-export type ApprovalPolicy = 'human' | 'mukai-only' | 'model';
+export type ApprovalMode = 'ask-for-approval' | 'full-access';
+export const APPROVAL_MODES = ['ask-for-approval', 'full-access'] as const;
 /**
  * confirm - sensitive tools run only after a human confirms via elicitation (refused when
  *           the client cannot show elicitation prompts).
@@ -23,7 +29,9 @@ export type SensitivePolicy = 'confirm' | 'disable' | 'allow';
 
 export interface SecurityPolicy {
   profile: ToolProfile;
-  approvals: ApprovalPolicy;
+  /** Default MCP approval mode for workspaces without their own setting. */
+  approvalMode: ApprovalMode;
+  stateFile: string;
   sensitive: SensitivePolicy;
   rawApi: boolean;
   enabledTools?: Set<string>;
@@ -47,7 +55,8 @@ const list = (value?: string) =>
 export function loadPolicy(env = process.env): SecurityPolicy {
   return {
     profile: oneOf('MCP_TOOL_PROFILE', env.MCP_TOOL_PROFILE?.trim(), ['read-only', 'standard', 'full'] as const, 'standard'),
-    approvals: oneOf('MCP_APPROVAL_POLICY', env.MCP_APPROVAL_POLICY?.trim(), ['human', 'mukai-only', 'model'] as const, 'human'),
+    approvalMode: oneOf('MCP_APPROVAL_MODE', env.MCP_APPROVAL_MODE?.trim(), APPROVAL_MODES, 'ask-for-approval'),
+    stateFile: env.MCP_STATE_FILE?.trim() || 'data/mcp-state.json',
     sensitive: oneOf('MCP_SENSITIVE_TOOLS', env.MCP_SENSITIVE_TOOLS?.trim(), ['confirm', 'disable', 'allow'] as const, 'confirm'),
     rawApi: env.MCP_ENABLE_RAW_API === 'true' || env.MCP_TOOL_PROFILE === 'full',
     enabledTools: env.MCP_ENABLED_TOOLS ? list(env.MCP_ENABLED_TOOLS) : undefined,
@@ -100,7 +109,6 @@ export function toolAllowed(policy: SecurityPolicy, name: string, meta: ToolMeta
   if (policy.enabledTools && !policy.enabledTools.has(name)) return false;
   if (name === 'mukai_api_request' && !policy.rawApi) return false;
   if (policy.profile === 'read-only' && !meta.readOnly) return false;
-  if (APPROVAL_TOOLS.has(name) && policy.approvals === 'mukai-only') return false;
   if (meta.sensitive && policy.sensitive === 'disable') return false;
   return true;
 }
@@ -208,5 +216,41 @@ export class FailureLimiter {
   }
   succeed(key: string) {
     this.failures.delete(key);
+  }
+}
+
+/**
+ * Per-workspace MCP approval modes (like Mukai's per-workspace modes), persisted to a small
+ * JSON file. If the file is lost, every workspace falls back to the safe default.
+ */
+export class ApprovalModes {
+  private modes: Record<string, ApprovalMode> = {};
+  constructor(
+    private file: string,
+    private fallback: ApprovalMode,
+  ) {
+    try {
+      const saved = JSON.parse(readFileSync(file, 'utf8')) as { approvalModes?: Record<string, string> };
+      for (const [id, mode] of Object.entries(saved.approvalModes || {}))
+        if ((APPROVAL_MODES as readonly string[]).includes(mode)) this.modes[id] = mode as ApprovalMode;
+    } catch {
+      /* no saved state yet */
+    }
+  }
+  get(workspaceId?: string): ApprovalMode {
+    return this.modes[workspaceId || 'default'] ?? this.fallback;
+  }
+  /** Every workspace with its own setting, plus the default. */
+  all() {
+    return { default: this.fallback, workspaces: { ...this.modes } };
+  }
+  set(workspaceId: string, mode: ApprovalMode) {
+    if (mode === this.fallback) delete this.modes[workspaceId];
+    else this.modes[workspaceId] = mode;
+    mkdirSync(dirname(this.file), { recursive: true });
+    const temporary = `${this.file}.${process.pid}.tmp`;
+    writeFileSync(temporary, JSON.stringify({ approvalModes: this.modes }, null, 2), { mode: 0o600 });
+    renameSync(temporary, this.file);
+    return this.get(workspaceId);
   }
 }

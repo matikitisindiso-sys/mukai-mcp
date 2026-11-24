@@ -16,6 +16,7 @@ import {
   redact,
   toolAllowed,
   type SecurityPolicy,
+  type ApprovalModes,
   type ToolMeta,
 } from './security.js';
 
@@ -25,6 +26,7 @@ const MAX_TEXT_CHARS = 200_000;
 export interface ToolOptions {
   chatWaitSeconds: number;
   policy: SecurityPolicy;
+  modes: ApprovalModes;
   sessionId?: () => string | undefined;
 }
 
@@ -313,54 +315,142 @@ export function registerTools(server: McpServer, client: MukaiClient, options: T
     );
   }
 
+  // ---- Who decides? -----------------------------------------------------------
+  // Mirrors Mukai: in a workspace whose MCP approval mode is full-access, the AI may decide
+  // TOOL approvals. Bot questions and yes/no go-aheads always go to the human, in every mode,
+  // just as Mukai keeps explicit questions waiting for the user even in Full access.
+  const { modes } = options;
+  const aiMayDecide = (item: PendingApproval) => approvalKind(item) === 'tool' && modes.get(item.workspaceId) === 'full-access';
+  const decidedBy = (item: PendingApproval) => (aiMayDecide(item) ? 'ai' : 'human');
+  const describePending = (item: PendingApproval, names?: Map<string, string>) => ({
+    id: item.id,
+    kind: approvalKind(item),
+    decidedBy: decidedBy(item),
+    workspaceId: item.workspaceId,
+    workspaceName: names?.get(item.workspaceId),
+    mcpApprovalMode: modes.get(item.workspaceId),
+    bot: item.botName ?? item.botId,
+    conversation: item.target?.name,
+    conversationId: item.conversationId,
+    batchId: item.batchId,
+    question: item.ask?.question,
+    options: item.ask?.options?.map((option) => option.label),
+    tool: item.ask ? undefined : item.toolName,
+    input: item.ask ? undefined : redact(item.input),
+    createdAt: item.createdAt,
+  });
+
+  /** Applies a decision the AI made itself — only ever reached when aiMayDecide(item). */
+  const aiDecides = async (item: PendingApproval, approved: boolean, reason?: string) => {
+    const body = approved ? { approved: true } : { approved: false, ...(reason ? { reason } : {}) };
+    try {
+      await client.json('POST', `/approvals/${encodeURIComponent(item.id)}`, { query: { workspaceId: item.workspaceId }, body });
+    } catch (error) {
+      if (error instanceof MukaiApiError && error.status === 409)
+        return { id: item.id, kind: approvalKind(item), decided: true, decision: 'already decided elsewhere' };
+      throw error;
+    }
+    audit({ event: 'approval.ai_decided', approvalId: item.id, workspaceId: item.workspaceId, tool: item.toolName, approved, reason });
+    return { id: item.id, kind: approvalKind(item), decided: true, decidedBy: 'ai', decision: approved ? 'approve' : 'reject' };
+  };
+
+  /** Routes one decision request according to the workspace mode and the request kind. */
+  const decide = async (item: PendingApproval, extra: Extra, approved?: boolean, reason?: string, answer?: string) => {
+    if (aiMayDecide(item)) {
+      if (approved === undefined) throw new Error('Provide approved=true or false for this tool approval.');
+      return aiDecides(item, approved, reason);
+    }
+    const suggestion = answer ?? (approved === undefined ? undefined : approved ? 'approve' : `reject${reason ? ` (${reason})` : ''}`);
+    try {
+      return await humanDecides(server, client, options.policy, extra, item, suggestion);
+    } catch (error) {
+      if (error instanceof ConfirmationUnavailable)
+        throw new ConfirmationUnavailable(
+          (approvalKind(item) === 'tool'
+            ? `This workspace's MCP approval mode is "${modes.get(item.workspaceId)}", so the human must decide this tool approval.`
+            : 'Bot questions and yes/no go-aheads always need the human, in every mode.') +
+            ' This client cannot show them a confirmation prompt; they can decide in Telegram or the Mukai app.',
+        );
+      throw error;
+    }
+  };
+
   // ---- Everything waiting for the human, wherever it started ----
   secure(
     'mukai_list_pending_approvals',
     {
       description:
-        'List EVERYTHING waiting for the human across all workspaces: tool approvals, bot questions and yes/no requests — ' +
-        'whether they started in the Mukai app, Telegram, a pursuit, or this MCP server. Decide them with mukai_decide_approval.',
+        'List EVERYTHING waiting for a decision across all workspaces: tool approvals, bot questions and yes/no requests — ' +
+        'whether they started in the Mukai app, Telegram, a pursuit, or this MCP server. Each item says decidedBy: ' +
+        '"ai" (you may decide it, workspace is in MCP full-access) or "human". Decide with mukai_decide_approval.',
       inputSchema: { workspaceId: z.string().optional().describe('Limit to one workspace') },
     },
     { readOnly: true, destructive: false, sensitive: false },
     async ({ workspaceId }) => {
-      const workspaces = ((await client.json<{ id: string; name: string }[]>('GET', '/workspaces').catch(() => [])) || []);
+      const workspaces = (await client.json<{ id: string; name: string }[]>('GET', '/workspaces').catch(() => [])) || [];
       const names = new Map(workspaces.map((item) => [item.id, item.name]));
       const items = await allPending(client, workspaceId);
+      return text({ count: items.length, pending: items.map((item) => describePending(item, names)) });
+    },
+  );
+
+  // ---- MCP approval mode (per workspace, like Mukai's own) ----
+  secure(
+    'mukai_get_mcp_approval_mode',
+    {
+      description:
+        "Show the MCP approval mode per workspace (who decides tool approvals for requests seen through MCP), next to Mukai's own workspace mode. " +
+        'ask-for-approval: the human decides everything. full-access: the AI may decide tool approvals; questions still go to the human.',
+      inputSchema: { workspaceId: z.string().optional() },
+    },
+    { readOnly: true, destructive: false, sensitive: false },
+    async ({ workspaceId }) => {
+      const workspaces = ((await client.json<{ id: string; name: string }[]>('GET', '/workspaces').catch(() => [])) || []).filter(
+        (item) => !workspaceId || item.id === workspaceId,
+      );
+      const rows = [];
+      for (const workspace of workspaces) {
+        const state = await client.json<{ mode?: string }>('GET', '/approvals', { query: { workspaceId: workspace.id } }).catch(() => undefined);
+        rows.push({ workspaceId: workspace.id, name: workspace.name, mcpApprovalMode: modes.get(workspace.id), mukaiApprovalMode: state?.mode });
+      }
       return text({
-        count: items.length,
-        pending: items.map((item) => ({
-          id: item.id,
-          kind: approvalKind(item),
-          workspaceId: item.workspaceId,
-          workspaceName: names.get(item.workspaceId),
-          bot: item.botName ?? item.botId,
-          conversation: item.target?.name,
-          conversationId: item.conversationId,
-          question: item.ask?.question,
-          options: item.ask?.options?.map((option) => option.label),
-          tool: item.ask ? undefined : item.toolName,
-          input: item.ask ? undefined : redact(item.input),
-          createdAt: item.createdAt,
-        })),
-        howToDecide:
-          policy.approvals === 'model'
-            ? 'Call mukai_decide_approval with approved=true/false (tools, yes_no) or answer=... (questions).'
-            : 'Call mukai_decide_approval with the id; the human confirms the decision in a prompt. Telegram and the Mukai app also work.',
+        default: modes.all().default,
+        workspaces: rows,
+        note: 'Mukai’s own mode decides whether bots ask at all (full-access there means no approvals are created). The MCP mode decides who answers the approvals that are created.',
       });
+    },
+  );
+  secure(
+    'mukai_set_mcp_approval_mode',
+    {
+      description:
+        'Set the MCP approval mode for a workspace. Switching to full-access lets the AI decide tool approvals and needs human confirmation; ' +
+        'switching to ask-for-approval is always allowed. Switching never decides requests that are already waiting.',
+      inputSchema: {
+        workspaceId: z.string().min(1),
+        mode: z.enum(['ask-for-approval', 'full-access']),
+      },
+    },
+    { readOnly: false, destructive: false, sensitive: false, sensitiveWhen: (args) => args?.mode === 'full-access' },
+    async ({ workspaceId, mode }) => {
+      if (mode === 'full-access' && options.policy.sensitive === 'disable')
+        throw new Error('Sensitive changes are disabled on this server, so full-access can only be set by the operator (MCP_APPROVAL_MODE).');
+      const workspaces = (await client.json<{ id: string }[]>('GET', '/workspaces')) || [];
+      if (!workspaces.some((item) => item.id === workspaceId)) throw new Error('Unknown workspace.');
+      const saved = modes.set(workspaceId, mode);
+      audit({ event: 'approval_mode.changed', workspaceId, mode: saved });
+      return text({ workspaceId, mcpApprovalMode: saved });
     },
   );
 
   // ---- Approval decisions ----
-  const approvalNote =
-    policy.approvals === 'human'
-      ? ' Under this server’s policy the HUMAN decides: they are shown Mukai’s record of the request in a confirmation prompt and their choice is applied. Your `approved`/`answer` values are only a suggestion.'
-      : '';
   secure(
     'mukai_decide_approval',
     {
       description:
-        'Approve or reject a pending tool call, or answer a bot question. Provide approved (+ optional reason) or answer.' + approvalNote,
+        'Decide a pending request (from mukai_list_pending_approvals or a chat result). Tool approvals: approved=true/false (+ optional reason). ' +
+        'Questions: answer. If the item is decidedBy "ai" your decision is applied; if "human", the human gets a confirmation prompt showing ' +
+        'Mukai’s record of the request and THEIR choice is applied — your values are only a suggestion.',
       inputSchema: {
         workspaceId: z.string().optional(),
         approvalId: z.string().min(1),
@@ -371,21 +461,16 @@ export function registerTools(server: McpServer, client: MukaiClient, options: T
     },
     { readOnly: false, destructive: false, sensitive: false },
     async ({ workspaceId, approvalId, approved, reason, answer }, extra) => {
-      if (policy.approvals === 'model') {
-        if (answer === undefined && approved === undefined) throw new Error('Provide approved or answer.');
-        const body = answer !== undefined ? { answer } : approved ? { approved: true } : { approved: false, ...(reason ? { reason } : {}) };
-        return text(await client.json('POST', `/approvals/${encodeURIComponent(approvalId)}`, { query: { workspaceId }, body }));
-      }
       const item = (await allPending(client, workspaceId)).find((entry) => entry.id === approvalId);
-      if (!item) throw new Error('That approval is not pending (it may already be decided in Mukai or Telegram).');
-      const suggestion = answer ?? (approved === undefined ? undefined : approved ? 'approve' : `reject${reason ? ` (${reason})` : ''}`);
-      return text(await humanDecides(server, client, policy, extra, item, suggestion));
+      if (!item) throw new Error('That request is not pending (it may already be decided in Mukai or Telegram).');
+      return text(await decide(item, extra, approved, reason, answer));
     },
   );
   secure(
     'mukai_decide_approval_batch',
     {
-      description: 'Decide every pending approval in a grouped batch.' + approvalNote,
+      description:
+        'Approve or reject several pending tool approvals at once. Items decidedBy "ai" are applied directly; the rest go to the human one by one.',
       inputSchema: {
         workspaceId: z.string().optional(),
         conversationId: z.string().min(1),
@@ -395,15 +480,11 @@ export function registerTools(server: McpServer, client: MukaiClient, options: T
       },
     },
     { readOnly: false, destructive: false, sensitive: false },
-    async ({ workspaceId, conversationId, batchId, ids, approved }, extra) => {
-      if (policy.approvals === 'model')
-        return text(
-          await client.json('POST', '/approvals/batch', { query: { workspaceId }, body: { conversationId, batchId, ids, approved } }),
-        );
+    async ({ workspaceId, ids, approved }, extra) => {
       const items = (await allPending(client, workspaceId)).filter((entry) => ids.includes(entry.id));
-      if (!items.length) throw new Error('None of those approvals are pending.');
+      if (!items.length) throw new Error('None of those requests are pending.');
       const results = [];
-      for (const item of items) results.push(await humanDecides(server, client, policy, extra, item, approved ? 'approve' : 'reject'));
+      for (const item of items) results.push(await decide(item, extra, approved));
       return text(results);
     },
   );
@@ -424,16 +505,24 @@ export function registerTools(server: McpServer, client: MukaiClient, options: T
         '"return" returns immediately with the pending request, "wait" keeps waiting while the human decides in Mukai or Telegram.',
     );
 
-  const hintFor = (status: ChatResult['status'], prompted: boolean) => {
-    if (status === 'awaiting_approval') {
-      if (policy.approvals === 'model')
-        return 'Pending approvals are listed in pendingApprovals. Decide with mukai_decide_approval, then re-call with the same requestId.';
-      return (
-        (prompted ? 'The human did not decide every request in the prompt. ' : '') +
-        'A human must decide pendingApprovals. They can do it in the Mukai app or Telegram (Mukai sends it there automatically when Telegram is connected)' +
-        (policy.approvals === 'human' && canElicit(server) ? ', or via mukai_decide_approval which prompts them here' : '') +
-        '. Then re-call with the same requestId to collect the rest of the reply. Do not try to approve it yourself.'
-      );
+  const hintFor = (status: ChatResult['status'], pending: PendingApproval[], prompted: boolean) => {
+    if (pending.length) {
+      const forAi = pending.filter(aiMayDecide).length;
+      const forHuman = pending.length - forAi;
+      const parts = [];
+      if (forAi)
+        parts.push(
+          `${forAi} tool approval(s) are yours to decide (workspace MCP mode is full-access): call mukai_decide_approval with approved=true/false.`,
+        );
+      if (forHuman)
+        parts.push(
+          (prompted ? 'The human did not decide every request in the prompt. ' : '') +
+            `${forHuman} request(s) need the human (decidedBy "human"). They can decide in Telegram or the Mukai app` +
+            (canElicit(server) ? ', or you can call mukai_decide_approval to show them a prompt here' : '') +
+            '. Do not decide these yourself.',
+        );
+      parts.push('Then re-call with the same requestId to collect the rest of the reply.');
+      return parts.join(' ');
     }
     if (status === 'timeout') return 'Wait budget expired; the bot is still working. Re-call with the same requestId to keep waiting.';
     if (status === 'stream_closed') return 'The stream closed before a final event. Check the conversation messages for the final state.';
@@ -459,11 +548,13 @@ export function registerTools(server: McpServer, client: MukaiClient, options: T
         sendRequestId: reattachable,
       });
       const pending = await pendingForRun(client, result);
-      const canPrompt = handling === 'prompt' && policy.approvals === 'human' && canElicit(server);
-      if (result.status === 'awaiting_approval' && pending.length && canPrompt) {
+      // Only requests the human must decide are prompted; the AI's own (full-access) ones go back to it.
+      const forHuman = pending.filter((item) => !aiMayDecide(item));
+      const canPrompt = handling === 'prompt' && canElicit(server);
+      if (result.status === 'awaiting_approval' && forHuman.length && canPrompt && forHuman.length === pending.length) {
         prompted = true;
         let allDecided = true;
-        for (const item of pending) {
+        for (const item of forHuman) {
           const outcome = await humanDecides(server, client, policy, extra, item);
           decisions.push(outcome);
           if (!outcome.decided) allDecided = false;
@@ -478,8 +569,8 @@ export function registerTools(server: McpServer, client: MukaiClient, options: T
       return text({
         ...rest,
         humanDecisions: decisions.length ? decisions : undefined,
-        pendingApprovals: stillPending,
-        hint: hintFor(stillPending.length ? 'awaiting_approval' : result.status, prompted),
+        pendingApprovals: stillPending.map((item) => describePending(item)),
+        hint: hintFor(result.status, stillPending, prompted),
       });
     }
   };
@@ -629,8 +720,8 @@ export function registerTools(server: McpServer, client: MukaiClient, options: T
     { readOnly: false, destructive: true, sensitive: false, sensitiveWhen: (args) => args?.method !== 'GET' },
     async ({ method, path, query, body }) => {
       const clean = '/' + String(path).replace(/^\/+/, '');
-      if (method !== 'GET' && /^\/+approvals(\/|$)/i.test(clean) && policy.approvals !== 'model')
-        throw new Error('Approval decisions must go through mukai_decide_approval so a human decides.');
+      if (method !== 'GET' && /^\/+approvals(\/|$)/i.test(clean))
+        throw new Error('Approval decisions and modes must go through the dedicated tools, which enforce who decides.');
       const response = await client.raw(method, clean, { query, body });
       const type = response.contentType;
       if (/json/.test(type) || !type) {

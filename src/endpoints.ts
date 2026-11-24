@@ -383,7 +383,7 @@ export const endpoints: Endpoint[] = [
   // Approvals
   {
     name: 'mukai_get_approvals',
-    description: 'Get the approval mode and all pending tool approvals / bot questions in a workspace.',
+    description: "Get MUKAI's own approval mode for a workspace (whether bots ask before using tools) and its raw pending list. For everything waiting across workspaces use mukai_list_pending_approvals.",
     method: 'GET',
     path: '/approvals',
     input: { workspaceId: ws },
@@ -391,7 +391,7 @@ export const endpoints: Endpoint[] = [
   },
   {
     name: 'mukai_set_approval_mode',
-    description: 'Set the workspace tool approval mode.',
+    description: "Set MUKAI's own workspace mode: ask-for-approval (bots pause before tools) or full-access (no approvals are created). Not the same as mukai_set_mcp_approval_mode.",
     method: 'PUT',
     path: '/approvals',
     input: { workspaceId: ws, mode: z.enum(['ask-for-approval', 'full-access']) },
