@@ -1,6 +1,9 @@
 // Minimal OpenAI-compatible model for end-to-end tests.
-// A user message "WRITEFILE <name>" makes the model call Mukai's file_operations
-// tool (which needs approval in ask-for-approval mode); otherwise it replies with text.
+// Trigger phrases in the latest user message:
+//   WRITEFILE <name>  -> calls file_operations (a tool approval in ask-for-approval mode)
+//   ASKQ              -> asks the user a question with suggested answers (communicate/clarification)
+//   ASKOK             -> asks the user for a yes/no go-ahead (communicate/approval)
+// Otherwise (or once the tool result is in) it replies with plain text.
 import http from 'node:http';
 const port = Number(process.env.MOCK_LLM_PORT || 11434);
 http
@@ -13,16 +16,27 @@ http
     }
     const json = body ? JSON.parse(body) : {};
     const msgs = json.messages || [];
-    const asks = msgs.map((m, i) => [m, i]).filter(([m]) => m.role === 'user' && /WRITEFILE \S+/.test(JSON.stringify(m.content)));
+    const asks = msgs.map((m, i) => [m, i]).filter(([m]) => m.role === 'user' && /WRITEFILE \S+|ASKQ|ASKOK/.test(JSON.stringify(m.content)));
     const ask = asks.pop();
     const toolResult = ask && msgs.slice(ask[1]).find((m) => m.role === 'tool');
     const base = { id: 'x', object: 'chat.completion.chunk', created: 1, model: 'mock-1' };
     const send = (delta, finish = null) => res.write('data: ' + JSON.stringify({ ...base, choices: [{ index: 0, delta, finish_reason: finish }] }) + '\n\n');
     res.writeHead(200, { 'Content-Type': 'text/event-stream' });
     if (ask && !toolResult) {
-      const name = /WRITEFILE (\S+)/.exec(JSON.stringify(ask[0].content))[1].replace(/[^\w.-]/g, '');
-      const args = JSON.stringify({ action: 'write_file', path: name, content: 'written via MCP approval test' });
-      send({ role: 'assistant', tool_calls: [{ index: 0, id: 'call_' + Date.now(), type: 'function', function: { name: 'file_operations', arguments: args } }] });
+      const said = JSON.stringify(ask[0].content);
+      let tool = 'communicate';
+      let args;
+      if (/ASKQ/.test(said))
+        args = { action: 'clarification', question: 'Which colour should the report use?', options: [
+          { label: 'Blue', description: 'Calm and corporate', recommended: true },
+          { label: 'Green', description: 'Fresh', recommended: false },
+        ] };
+      else if (/ASKOK/.test(said)) args = { action: 'approval', question: 'May I publish the draft?' };
+      else {
+        tool = 'file_operations';
+        args = { action: 'write_file', path: /WRITEFILE (\S+)/.exec(said)[1].replace(/[^\w.-]/g, ''), content: 'written via MCP approval test' };
+      }
+      send({ role: 'assistant', tool_calls: [{ index: 0, id: 'call_' + Date.now(), type: 'function', function: { name: tool, arguments: JSON.stringify(args) } }] });
       send({}, 'tool_calls');
       return res.end('data: [DONE]\n\n');
     }

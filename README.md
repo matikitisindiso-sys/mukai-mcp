@@ -16,7 +16,7 @@ MCP client ──(Streamable HTTP + bearer)──▶ mukai-mcp ──(Bearer api
 See **[docs/MUKAI_API.md](docs/MUKAI_API.md)** for every Mukai route and its tool, and
 **[docs/SECURITY.md](docs/SECURITY.md)** for the security model.
 
-## Tools (138 by default, 53 in read-only, 139 in full)
+## Tools (139 by default, 54 in read-only, 140 in full)
 
 | Area | Tools |
 | --- | --- |
@@ -24,7 +24,7 @@ See **[docs/MUKAI_API.md](docs/MUKAI_API.md)** for every Mukai route and its too
 | Workspaces | list, create, update, delete, timezone, VM computer status/start/stop/resources/setup |
 | Bots | list, create, `mukai_update_bot` (partial), replace, delete, set model, messages, files, artifacts, attachments, new private conversation |
 | Conversations / spaces | list (private / bot / history), create space, import, get, messages, outputs, terminal, trajectory, artifacts, saved, references, activity images, file changes |
-| Approvals | get pending, set mode (`ask-for-approval` / `full-access`), approve/reject/answer, batch |
+| Approvals | `mukai_list_pending_approvals` (everything waiting, from the app, Telegram, pursuits or MCP), set mode, approve/reject/answer questions, batch |
 | Providers | list, create, update, delete, test, models, ChatGPT sign-in/disconnect |
 | Pursuits | list, get, delete, pause/resume, run now, run detail, retry, workpad |
 | Memory | snapshot, search, context, fact get/correct/forget, episodes, settings, embeddings, import/export, consolidate, clear |
@@ -47,6 +47,9 @@ When a bot needs approval, **the human decides, not the AI model**:
 - In clients that support MCP elicitation (confirmation prompts), the human gets a prompt built
   from Mukai's own record of the request. Their choice is applied and the tool waits for the
   rest of the reply.
+- Requests raised **in the Mukai app** (tool approvals, questions with suggested answers, yes/no
+  go-aheads) show up via `mukai_list_pending_approvals` and can be answered with
+  `mukai_decide_approval` while you're away from your desk.
 - Otherwise the result is `status: "awaiting_approval"` with `pendingApprovals`, and the human
   approves in **Telegram** or the Mukai app. Telegram receives every pending approval no matter
   who started the run, so MCP-triggered requests show up there too. Re-call with the same
@@ -149,7 +152,7 @@ treat it like a root password. The threat model and every setting are in
 
 `test/e2e.mjs` runs against a real Mukai backend with a mock model (`test/mock-llm.mjs`).
 It covers approve, reject, a dismissed prompt, model self-approval being blocked, approving
-from outside MCP while the tool waits, confirmation of sensitive actions, path traversal and
+from outside MCP while the tool waits, answering app-raised questions/approvals via MCP, confirmation of sensitive actions, path traversal and
 auth lockout.
 
 ```sh

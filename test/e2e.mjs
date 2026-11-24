@@ -194,6 +194,107 @@ await test('sensitive actions are refused outright', async () => {
   await client.close();
 });
 
+console.log('Requests started in the Mukai app (not via MCP), seen and answered through MCP');
+
+/** Starts a chat exactly like the Mukai UI does (direct API, streamed) and resolves with the final message. */
+function uiChat(text) {
+  return (async () => {
+    const res = await fetch(`${MUKAI_API_URL}/bots/${bot.id}/chat`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${MUKAI_API_TOKEN}`, 'Content-Type': 'application/json', Accept: 'application/x-ndjson' },
+      body: JSON.stringify({ requestId: crypto.randomUUID(), text, attachmentIds: [] }),
+    });
+    let buffer = '';
+    for await (const chunk of res.body) {
+      buffer += Buffer.from(chunk).toString('utf8');
+      for (const line of buffer.split('\n')) {
+        try {
+          const event = JSON.parse(line);
+          if (event.type === 'done' || event.type === 'error') return event.message;
+        } catch {}
+      }
+    }
+  })();
+}
+async function waitForPending(call, kind) {
+  for (let i = 0; i < 50; i++) {
+    const r = await call('mukai_list_pending_approvals');
+    const item = r.json.pending.find((p) => p.kind === kind);
+    if (item) return { item, list: r.json };
+    await new Promise((r) => setTimeout(r, 200));
+  }
+  throw new Error(`no pending ${kind}`);
+}
+
+await test('bot question asked in the app → listed via MCP with its options → human picks an answer → app gets it', async () => {
+  const { client, call, prompts } = await connect(() => ({ action: 'accept', content: { choice: 'Green' } }));
+  const reply = uiChat('ASKQ please');
+  const { item, list } = await waitForPending(call, 'question');
+  assert.equal(item.question, 'Which colour should the report use?');
+  assert.deepEqual(item.options, ['Blue', 'Green']);
+  assert.equal(item.workspaceName, workspace.name);
+  assert.ok(list.count >= 1);
+  const decided = await call('mukai_decide_approval', { approvalId: item.id, answer: 'Blue' });
+  assert.equal(decided.json.decided, true, decided.text);
+  assert.equal(decided.json.decision, 'answered: Green'); // the human's pick wins over the AI's suggestion
+  assert.match(prompts[0].message, /Which colour/);
+  assert.match(prompts[0].message, /The AI assistant suggests: Blue/);
+  const final = await reply;
+  assert.equal(final.status, 'complete');
+  assert.match(final.content, /Green/);
+  await client.close();
+});
+
+await test('yes/no go-ahead asked in the app → approved via MCP → app continues', async () => {
+  const { client, call } = await connect(() => ({ action: 'accept', content: { decision: 'approve' } }));
+  const reply = uiChat('ASKOK please');
+  const { item } = await waitForPending(call, 'yes_no');
+  assert.equal(item.question, 'May I publish the draft?');
+  const decided = await call('mukai_decide_approval', { approvalId: item.id, approved: true });
+  assert.equal(decided.json.decision, 'approve', decided.text);
+  const final = await reply;
+  assert.equal(final.status, 'complete');
+  assert.match(final.content, /true/);
+  await client.close();
+});
+
+await test('tool approval raised in the app → approved via MCP → tool runs', async () => {
+  const { client, call } = await connect(() => ({ action: 'accept', content: { decision: 'approve' } }));
+  const reply = uiChat('WRITEFILE from-app.txt');
+  const { item } = await waitForPending(call, 'tool');
+  assert.equal(item.tool, 'file_operations');
+  await call('mukai_decide_approval', { approvalId: item.id, approved: true });
+  assert.equal((await reply).status, 'complete');
+  assert.ok(existsSync(file('from-app.txt')));
+  await client.close();
+});
+
+if (process.env.MCP_URL_MODEL_POLICY) {
+  await test('with MCP_APPROVAL_POLICY=model the assistant can approve directly (no prompt support needed)', async () => {
+    const saved = process.env.MCP_URL;
+    const { Client: C } = await import('@modelcontextprotocol/sdk/client/index.js');
+    const c = new C({ name: 'e2e-model', version: '1' });
+    await c.connect(
+      new StreamableHTTPClientTransport(new URL(process.env.MCP_URL_MODEL_POLICY), {
+        requestInit: { headers: { Authorization: `Bearer ${MCP_AUTH_TOKEN}` } },
+      }),
+    );
+    const reply = uiChat('WRITEFILE model-policy.txt');
+    let item;
+    for (let i = 0; i < 50 && !item; i++) {
+      const r = await c.callTool({ name: 'mukai_list_pending_approvals', arguments: {} });
+      item = JSON.parse(r.content[0].text.replace(/^\[Mukai data[^\]]*\]\n/, '')).pending.find((p) => p.kind === 'tool');
+      if (!item) await new Promise((r) => setTimeout(r, 200));
+    }
+    const r = await c.callTool({ name: 'mukai_decide_approval', arguments: { approvalId: item.id, workspaceId: item.workspaceId, approved: true } });
+    assert.equal(!!r.isError, false, r.content[0].text);
+    assert.equal((await reply).status, 'complete');
+    assert.ok(existsSync(file('model-policy.txt')));
+    await c.close();
+    process.env.MCP_URL = saved;
+  });
+}
+
 console.log('Hardening');
 
 await test('raw API tool is not exposed by default; results are labelled untrusted', async () => {

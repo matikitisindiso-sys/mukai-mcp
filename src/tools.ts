@@ -142,9 +142,21 @@ async function pendingForRun(client: MukaiClient, result: ChatResult) {
   );
 }
 
+/** tool = a tool call waiting for permission; question = bot asks you something; yes_no = bot asks to proceed. */
+export function approvalKind(item: PendingApproval): 'tool' | 'question' | 'yes_no' {
+  if (item.ask?.action === 'clarification') return 'question';
+  if (item.ask) return 'yes_no';
+  return 'tool';
+}
+
 function describeApproval(item: PendingApproval) {
+  const kind = approvalKind(item);
   const lines = [
-    item.ask ? 'A Mukai bot is asking you a question.' : 'A Mukai bot is waiting for your approval.',
+    kind === 'question'
+      ? 'A Mukai bot is asking you a question.'
+      : kind === 'yes_no'
+        ? 'A Mukai bot is asking for your go-ahead.'
+        : 'A Mukai bot is waiting for your approval to use a tool.',
     `Bot: ${item.botName ?? item.botId ?? 'unknown'}`,
   ];
   if (item.target?.name) lines.push(`Conversation: ${item.target.name}`);
@@ -171,42 +183,59 @@ async function humanDecides(
   item: PendingApproval,
   suggestion?: string,
 ) {
+  const kind = approvalKind(item);
   const message = describeApproval(item) + (suggestion ? `\n\nThe AI assistant suggests: ${suggestion}` : '');
-  const result = item.ask
-    ? await askHuman(server, extra.requestId, policy, message, { answer: { type: 'string', title: 'Your answer', maxLength: 16000 } }, ['answer'])
-    : await askHuman(
-        server,
-        extra.requestId,
-        policy,
-        message,
-        {
-          decision: { type: 'string', title: 'Decision', enum: ['approve', 'reject'], enumNames: ['Approve', 'Reject'] },
-          reason: { type: 'string', title: 'Reason (optional, sent to the bot when rejecting)', maxLength: 16000 },
-        },
-        ['decision'],
-      );
-  if (result.action !== 'accept' || !result.content) {
+  const options = (item.ask?.options || []).map((option) => option.label);
+  const result =
+    kind === 'question'
+      ? await askHuman(
+          server,
+          extra.requestId,
+          policy,
+          message,
+          {
+            ...(options.length ? { choice: { type: 'string', title: 'Pick a suggested answer', enum: options } } : {}),
+            answer: { type: 'string', title: options.length ? 'Or type your own answer' : 'Your answer', maxLength: 16000 },
+          },
+          options.length ? [] : ['answer'],
+        )
+      : await askHuman(
+          server,
+          extra.requestId,
+          policy,
+          message,
+          {
+            decision: { type: 'string', title: 'Decision', enum: ['approve', 'reject'], enumNames: ['Approve', 'Reject'] },
+            reason: { type: 'string', title: 'Reason (optional, sent to the bot when rejecting)', maxLength: 16000 },
+          },
+          ['decision'],
+        );
+  const content = (result.content || {}) as Record<string, unknown>;
+  const answer = String(content.answer ?? '').trim() || String(content.choice ?? '').trim();
+  if (result.action !== 'accept' || (kind === 'question' ? !answer : !content.decision)) {
     audit({ event: 'approval.human_skipped', approvalId: item.id, action: result.action });
-    return { id: item.id, decided: false as const, action: result.action };
+    return { id: item.id, kind, decided: false as const, action: result.action };
   }
-  const content = result.content as Record<string, unknown>;
-  const body = item.ask
-    ? { answer: String(content.answer ?? '').trim() }
-    : content.decision === 'approve'
-      ? { approved: true }
-      : { approved: false, ...(String(content.reason ?? '').trim() ? { reason: String(content.reason).trim() } : {}) };
+  const reason = String(content.reason ?? '').trim();
+  const body =
+    kind === 'question'
+      ? { answer }
+      : content.decision === 'approve'
+        ? { approved: true }
+        : { approved: false, ...(reason ? { reason } : {}) };
+  const decision = kind === 'question' ? `answered: ${answer}` : String(content.decision);
   try {
     await client.json('POST', `/approvals/${encodeURIComponent(item.id)}`, { query: { workspaceId: item.workspaceId }, body });
   } catch (error) {
     // Someone decided it first (Mukai app, Telegram, another client): theirs stands.
     if (error instanceof MukaiApiError && error.status === 409) {
       audit({ event: 'approval.already_decided', approvalId: item.id });
-      return { id: item.id, decided: true as const, decision: 'already decided elsewhere' };
+      return { id: item.id, kind, decided: true as const, decision: 'already decided elsewhere' };
     }
     throw error;
   }
-  audit({ event: 'approval.human_decided', approvalId: item.id, decision: item.ask ? 'answered' : content.decision });
-  return { id: item.id, decided: true as const, decision: item.ask ? 'answered' : content.decision };
+  audit({ event: 'approval.human_decided', approvalId: item.id, kind, decision: kind === 'question' ? 'answered' : decision });
+  return { id: item.id, kind, decided: true as const, decision };
 }
 
 // ---- Registration -------------------------------------------------------------
@@ -283,6 +312,44 @@ export function registerTools(server: McpServer, client: MukaiClient, options: T
       },
     );
   }
+
+  // ---- Everything waiting for the human, wherever it started ----
+  secure(
+    'mukai_list_pending_approvals',
+    {
+      description:
+        'List EVERYTHING waiting for the human across all workspaces: tool approvals, bot questions and yes/no requests — ' +
+        'whether they started in the Mukai app, Telegram, a pursuit, or this MCP server. Decide them with mukai_decide_approval.',
+      inputSchema: { workspaceId: z.string().optional().describe('Limit to one workspace') },
+    },
+    { readOnly: true, destructive: false, sensitive: false },
+    async ({ workspaceId }) => {
+      const workspaces = ((await client.json<{ id: string; name: string }[]>('GET', '/workspaces').catch(() => [])) || []);
+      const names = new Map(workspaces.map((item) => [item.id, item.name]));
+      const items = await allPending(client, workspaceId);
+      return text({
+        count: items.length,
+        pending: items.map((item) => ({
+          id: item.id,
+          kind: approvalKind(item),
+          workspaceId: item.workspaceId,
+          workspaceName: names.get(item.workspaceId),
+          bot: item.botName ?? item.botId,
+          conversation: item.target?.name,
+          conversationId: item.conversationId,
+          question: item.ask?.question,
+          options: item.ask?.options?.map((option) => option.label),
+          tool: item.ask ? undefined : item.toolName,
+          input: item.ask ? undefined : redact(item.input),
+          createdAt: item.createdAt,
+        })),
+        howToDecide:
+          policy.approvals === 'model'
+            ? 'Call mukai_decide_approval with approved=true/false (tools, yes_no) or answer=... (questions).'
+            : 'Call mukai_decide_approval with the id; the human confirms the decision in a prompt. Telegram and the Mukai app also work.',
+      });
+    },
+  );
 
   // ---- Approval decisions ----
   const approvalNote =

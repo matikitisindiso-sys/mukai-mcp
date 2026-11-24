@@ -52,6 +52,20 @@ once a second and posts every pending approval in Telegram-enabled workspaces, w
 it.** So a request that started from MCP shows up in Telegram as usual. Whoever decides first
 (Telegram, the Mukai app, or the MCP prompt) wins, and the others see "no longer pending".
 
+**It works in both directions.** A request raised in the Mukai app (or by a pursuit, or a
+bot-to-bot task) shows up through MCP: `mukai_list_pending_approvals` lists every waiting tool
+approval, bot question (with its suggested answers) and yes/no request across all workspaces,
+and `mukai_decide_approval` answers it. The app gets the answer exactly as if you had clicked
+there. In the other direction, a request raised by a run that MCP started shows up in Telegram
+and the app as usual.
+
+To **approve through MCP**, you need one of these:
+- a client that supports confirmation prompts (elicitation): you decide in the prompt, under the
+  default `MCP_APPROVAL_POLICY=human`, or
+- `MCP_APPROVAL_POLICY=model`: you tell the assistant "approve it" and it calls the tool
+  directly. This works in any client, but injected content could then also get the assistant to
+  approve things. Keep the MCP token private and review the audit log.
+
 When a bot run that the MCP started needs approval:
 
 | `approvalHandling` (chat tools) | Behavior |
@@ -70,7 +84,7 @@ the app.
 | --- | --- | --- |
 | `MCP_APPROVAL_POLICY` | `human` | `human`: the human decides through prompts. `mukai-only`: no approval tools; decide in the app or Telegram. `model`: the model may decide (not recommended). |
 | `MCP_SENSITIVE_TOOLS` | `confirm` | `confirm`: needs a human prompt, refused if the client can't show one. `disable`: tools hidden. `allow`: no confirmation. |
-| `MCP_TOOL_PROFILE` | `standard` | `read-only` (53 tools, nothing that changes state), `standard` (138), `full` (139, adds the raw API tool) |
+| `MCP_TOOL_PROFILE` | `standard` | `read-only` (54 tools, nothing that changes state), `standard` (139), `full` (140, adds the raw API tool) |
 | `MCP_ENABLE_RAW_API` | `false` | Expose `mukai_api_request`. Its non-GET calls still need confirmation. |
 | `MCP_ENABLED_TOOLS` / `MCP_DISABLED_TOOLS` | — | Comma-separated allow/deny list of tool names |
 | `MCP_CONFIRM_TIMEOUT_SECONDS` | `600` | How long a prompt waits for the human |
