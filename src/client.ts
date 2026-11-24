@@ -6,6 +6,32 @@ export interface MukaiClientOptions {
   token: string;
   /** Per-request timeout for ordinary (non-streaming) calls. */
   timeoutMs?: number;
+  /** Cloudflare Access service token, sent on every request when Mukai sits behind Zero Trust. */
+  cloudflareAccess?: { clientId: string; clientSecret: string };
+}
+
+/**
+ * Turns a Cloudflare Access refusal into a clear error. Access answers unauthenticated
+ * programs with a redirect to its login page (or an HTML 403); following that redirect would
+ * hand the tools a login page instead of Mukai data, so redirects are never followed.
+ */
+function accessRefusal(response: Response, configured: boolean): MukaiApiError | undefined {
+  const fix = configured
+    ? 'Check MUKAI_CF_ACCESS_CLIENT_ID/SECRET and that the Access application has a "Service Auth" policy allowing this service token.'
+    : 'Mukai appears to be behind Cloudflare Access: create a service token and set MUKAI_CF_ACCESS_CLIENT_ID and MUKAI_CF_ACCESS_CLIENT_SECRET.';
+  if (response.status >= 300 && response.status < 400) {
+    let where = 'a login page';
+    try {
+      where = new URL(response.headers.get('location') || '').host || where;
+    } catch {
+      /* keep generic */
+    }
+    return new MukaiApiError(502, `Blocked before reaching Mukai: redirected to ${where}. ${fix}`);
+  }
+  const html = /text\/html/i.test(response.headers.get('content-type') || '');
+  if ((response.status === 401 || response.status === 403) && html && response.headers.get('cf-ray'))
+    return new MukaiApiError(502, `Blocked by Cloudflare (HTTP ${response.status}) before reaching Mukai. ${fix}`);
+  return undefined;
 }
 
 export class MukaiApiError extends Error {
@@ -66,7 +92,12 @@ export class MukaiClient {
   private headers(extra: Record<string, string> = {}): Record<string, string> {
     // Never send an Origin header: Mukai accepts remote native clients only when
     // Origin is absent and the bearer token matches.
-    return { Authorization: `Bearer ${this.options.token}`, ...extra };
+    const access = this.options.cloudflareAccess;
+    return {
+      Authorization: `Bearer ${this.options.token}`,
+      ...(access ? { 'CF-Access-Client-Id': access.clientId, 'CF-Access-Client-Secret': access.clientSecret } : {}),
+      ...extra,
+    };
   }
 
   async raw(
@@ -91,8 +122,11 @@ export class MukaiClient {
       method,
       headers,
       body: payload,
+      redirect: 'manual',
       signal: AbortSignal.timeout(this.options.timeoutMs ?? 120_000),
     });
+    const refused = accessRefusal(response, !!this.options.cloudflareAccess);
+    if (refused) throw refused;
     const bytes = Buffer.from(await response.arrayBuffer());
     const contentType = response.headers.get('content-type') || '';
     const disposition = response.headers.get('content-disposition') || '';
@@ -187,8 +221,11 @@ export class MukaiClient {
         method: 'POST',
         headers: this.headers({ 'Content-Type': 'application/json', Accept: 'application/x-ndjson' }),
         body: JSON.stringify(payload),
+        redirect: 'manual',
         signal: controller.signal,
       });
+      const refused = accessRefusal(response, !!this.options.cloudflareAccess);
+      if (refused) throw refused;
       if (!response.ok || !response.body) {
         const text = await response.text();
         let message = text;

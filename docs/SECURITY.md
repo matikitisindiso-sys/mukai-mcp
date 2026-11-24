@@ -39,6 +39,7 @@ Human ─▶ MCP client (Claude, …) ─▶ [1] MCP server ─▶ [2] Mukai API
 | **Destruction** | Deleting workspaces, bots, memory, providers | Destructive tools need confirmation and carry `destructiveHint`. Mukai also requires the exact workspace name. |
 | **Secret leakage** | API keys showing up in logs or prompts | Keys named like `apiKey`, `token`, `secret`, `password` and env `value`s are redacted in audit logs and confirmation prompts. Mukai never returns saved keys. |
 | **Path tricks / SSRF** | IDs such as `../settings/api`, or paths that leave the API | Rejected before any request is made. Requests only ever go to `MUKAI_API_URL`. |
+| **Network exposure of Mukai** | Mukai reachable from the internet | Put Mukai behind Cloudflare Zero Trust. The MCP server gets through with a revocable **service token** (`MUKAI_CF_ACCESS_CLIENT_ID/SECRET`), only ever sent over HTTPS (or to loopback), and never follows Access's login redirects. Or run the MCP server on the same machine and use localhost. |
 | **Brute force / scanning** | Guessing the MCP token | 32+ character minimum and lockout. Run it behind HTTPS (a token is a password). |
 
 Every tool call is written to stderr as a JSON audit line: time, session, tool, redacted
@@ -173,7 +174,8 @@ the mode and rules) come back to it rather than prompting the human.
 2. Serve the MCP endpoint **only over HTTPS**. Set `MCP_ALLOWED_HOSTS=mcp.yourdomain.com`, and
    set `MCP_TRUST_PROXY=true` if it sits behind a proxy.
 3. Point `MUKAI_API_URL` at loopback, or at an HTTPS Mukai address. The server warns about
-   anything else.
+   anything else. If Mukai is behind Cloudflare Access, set the service token
+   (`MUKAI_CF_ACCESS_CLIENT_ID/SECRET`) and add a Service Auth policy for it.
 4. Keep the defaults: `MCP_APPROVAL_MODE=ask-for-approval`, `MCP_SENSITIVE_TOOLS=confirm`, and Mukai
    workspaces in **ask-for-approval** mode.
 5. Use an MCP client that supports elicitation for approvals and sensitive actions. Otherwise

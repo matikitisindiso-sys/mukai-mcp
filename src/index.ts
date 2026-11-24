@@ -35,7 +35,18 @@ try {
 if (!/^https:\/\//i.test(apiUrl) && !/^http:\/\/(127\.0\.0\.1|localhost|\[::1\])(:\d+)?(\/|$)/i.test(apiUrl))
   console.error('WARNING: MUKAI_API_URL is not HTTPS and not loopback; the Mukai API token would travel unencrypted.');
 
-const client = new MukaiClient({ baseUrl: apiUrl, token: apiToken });
+// Cloudflare Zero Trust: a service token lets this server through Access to Mukai.
+const cfId = env('MUKAI_CF_ACCESS_CLIENT_ID');
+const cfSecret = env('MUKAI_CF_ACCESS_CLIENT_SECRET');
+if (!!cfId !== !!cfSecret) fail('Set both MUKAI_CF_ACCESS_CLIENT_ID and MUKAI_CF_ACCESS_CLIENT_SECRET, or neither.');
+const loopback = /^http:\/\/(127\.0\.0\.1|localhost|\[::1\])(:\d+)?(\/|$)/i.test(apiUrl);
+if (cfId && !/^https:\/\//i.test(apiUrl) && !loopback)
+  fail('Refusing to send the Cloudflare Access service token over plain HTTP. Use an https:// MUKAI_API_URL.');
+const client = new MukaiClient({
+  baseUrl: apiUrl,
+  token: apiToken,
+  cloudflareAccess: cfId && cfSecret ? { clientId: cfId, clientSecret: cfSecret } : undefined,
+});
 // One permission store shared by every session: operator rules (MCP_RULES_FILE) plus the
 // user's own rules and modes, persisted to MCP_STATE_FILE.
 let permissions: PermissionStore;
@@ -183,7 +194,7 @@ async function runHttp() {
   app.listen(port, host, () => {
     console.error(
       `Mukai MCP server on http://${host}:${port}/mcp -> ${apiUrl} ` +
-        `[profile=${policy.profile} approvalMode=${policy.approvalMode} rules=${policy.rulesFile ?? 'none'} sensitive=${policy.sensitive} rawApi=${policy.rawApi}]`,
+        `[profile=${policy.profile} approvalMode=${policy.approvalMode} rules=${policy.rulesFile ?? 'none'} cloudflareAccess=${cfId ? 'service-token' : 'off'} sensitive=${policy.sensitive} rawApi=${policy.rawApi}]`,
     );
   });
 }

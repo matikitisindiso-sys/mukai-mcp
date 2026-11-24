@@ -84,12 +84,38 @@ cp .env.example .env   # then fill in values; export them or use your platform's
 | Variable | Required | Description |
 | --- | --- | --- |
 | `MUKAI_API_URL` | yes | Mukai backend base URL. See below. |
+| `MUKAI_CF_ACCESS_CLIENT_ID` / `MUKAI_CF_ACCESS_CLIENT_SECRET` | if Mukai is behind Cloudflare Access | Cloudflare Access service token. See below. |
 | `MUKAI_API_TOKEN` | yes | Mukai API token. Find it in **Mukai → Settings → API**, or read it from the `api.token` file in the Mukai data directory (that file holds raw bytes; the token is their hex: `od -An -tx1 -v api.token \| tr -d ' \n'`). |
 | `MCP_AUTH_TOKEN` | HTTP mode | Bearer token that clients must send to this server, at least 32 characters. Generate one with `openssl rand -hex 32`. |
 | `PORT` / `HOST` | no | Listener address. Defaults to `3333` / `0.0.0.0`. |
 | `MCP_ALLOWED_HOSTS` | no | Comma-separated allowlist for the `Host` header, which protects against DNS rebinding, e.g. `mcp.example.com`. |
 | `MUKAI_CHAT_WAIT_SECONDS` | no | How long chat tools wait by default. Default `55`. Keep it below your client's tool timeout. |
 | `MCP_APPROVAL_MODE`, `MCP_SENSITIVE_TOOLS`, `MCP_TOOL_PROFILE`, … | no | Security policy. Safe by default; see [docs/SECURITY.md](docs/SECURITY.md#configuration). |
+
+### Mukai behind Cloudflare Zero Trust (Access)
+
+If Mukai is protected by Cloudflare Access, give the MCP server a **service token**. It's a
+deliberate, revocable key for this program; nothing is bypassed.
+
+1. In Cloudflare Zero Trust: **Access → Service Auth → Create service token**. Copy the Client
+   ID and Client Secret.
+2. In Mukai's Access application, add a policy with action **Service Auth** that includes that
+   token. Your login policy for people stays as it is.
+3. Set `MUKAI_CF_ACCESS_CLIENT_ID` and `MUKAI_CF_ACCESS_CLIENT_SECRET`. The MCP server sends
+   them on every request to Mukai, including streamed chats.
+
+Notes:
+- The server refuses to start if only one of the two is set, or if `MUKAI_API_URL` is plain
+  HTTP to another machine (the token would travel unencrypted).
+- If Access blocks a request, tools report "Blocked before reaching Mukai … check the service
+  token / Service Auth policy". Redirects are never followed, so Cloudflare's login page is
+  never mistaken for Mukai data.
+- To cut off access, revoke the token in Cloudflare. Mukai's own API token is still required on
+  top, so this is two locks rather than one.
+- If the MCP server runs **on the same machine** as Mukai, you can skip Cloudflare entirely and
+  use `http://127.0.0.1:47831`. That path never leaves the machine. Use the service token
+  when they're on different machines, or everywhere if you want Cloudflare's off switch and
+  logs.
 
 ### Choosing `MUKAI_API_URL`
 
@@ -176,6 +202,8 @@ node test/e2e.mjs
 ```
 
 Unit tests for the permission rules (no backend needed): `npm test`.
+Cloudflare Access test (fake Access gate in front of a real Mukai): `node test/cf-access.mjs` with
+`MUKAI_API_URL`, `MUKAI_API_TOKEN` and `TEST_FOLDER`.
 
 Run `node scripts/gen-api-doc.mjs` after changing `src/endpoints.ts` to regenerate the API
 inventory.
