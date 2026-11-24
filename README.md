@@ -13,7 +13,10 @@ It doesn't change Mukai at all. Each tool turns into a call to one of Mukai's ow
 MCP client ──(Streamable HTTP + bearer)──▶ mukai-mcp ──(Bearer api.token)──▶ Mukai backend
 ```
 
-## Tools (139)
+See **[docs/MUKAI_API.md](docs/MUKAI_API.md)** for every Mukai route and its tool, and
+**[docs/SECURITY.md](docs/SECURITY.md)** for the security model.
+
+## Tools (138 by default, 53 in read-only, 139 in full)
 
 | Area | Tools |
 | --- | --- |
@@ -32,22 +35,26 @@ MCP client ──(Streamable HTTP + bearer)──▶ mukai-mcp ──(Bearer api
 | Settings | profile, appearance, updates, limits, AI activity |
 | Telegram | status, connect, pairing, access, enable, disconnect |
 | Files | upload attachment, download artifact/attachment (images come back as images) |
-| Escape hatch | `mukai_api_request`: any route that has no tool of its own |
+| Escape hatch | `mukai_api_request`: any route without a dedicated tool. Off unless `MCP_ENABLE_RAW_API=true` |
 
-### How chat works
+### How chat and approvals work
 
 Mukai streams chat replies. The chat tools read that stream and return the final text, the tool
-activity, and any pending approvals in one result:
+activity, and any pending approvals in one result. Mukai runs live on the backend:
+disconnecting never cancels a run, and sending the same `requestId` again reattaches to it.
 
-- `status: "done"`: the reply is complete.
-- `status: "awaiting_approval"`: the bot needs a decision. Each `pendingApprovals[]` entry has
-  `id` and `workspaceId`. Call `mukai_decide_approval`, then call the chat tool again with the same
-  `requestId` to pick the run back up.
-- `status: "timeout"`: the wait ran out but the bot is still working. Call again with the same
-  `requestId` to keep waiting.
+When a bot needs approval, **the human decides, not the AI model**:
+- In clients that support MCP elicitation (confirmation prompts), the human gets a prompt built
+  from Mukai's own record of the request. Their choice is applied and the tool waits for the
+  rest of the reply.
+- Otherwise the result is `status: "awaiting_approval"` with `pendingApprovals`, and the human
+  approves in **Telegram** or the Mukai app. Telegram receives every pending approval no matter
+  who started the run, so MCP-triggered requests show up there too. Re-call with the same
+  `requestId`, or use `approvalHandling: "wait"`, to collect the reply.
 
-Mukai runs live on the backend. Disconnecting never cancels a run, and sending the same
-`requestId` again reattaches to it instead of starting a new one.
+Sensitive actions (deletes, providers, custom code, skills, workspace folders, Telegram,
+secrets, turning on full access) need the same kind of human confirmation. Details are in
+[docs/SECURITY.md](docs/SECURITY.md).
 
 ## Setup
 
@@ -63,10 +70,11 @@ cp .env.example .env   # then fill in values; export them or use your platform's
 | --- | --- | --- |
 | `MUKAI_API_URL` | yes | Mukai backend base URL. See below. |
 | `MUKAI_API_TOKEN` | yes | Mukai API token. Find it in **Mukai → Settings → API**, or read it from the `api.token` file in the Mukai data directory (that file holds raw bytes; the token is their hex: `od -An -tx1 -v api.token \| tr -d ' \n'`). |
-| `MCP_AUTH_TOKEN` | HTTP mode | Bearer token that clients must send to this server. Generate one with `openssl rand -hex 32`. |
+| `MCP_AUTH_TOKEN` | HTTP mode | Bearer token that clients must send to this server, at least 32 characters. Generate one with `openssl rand -hex 32`. |
 | `PORT` / `HOST` | no | Listener address. Defaults to `3333` / `0.0.0.0`. |
 | `MCP_ALLOWED_HOSTS` | no | Comma-separated allowlist for the `Host` header, which protects against DNS rebinding, e.g. `mcp.example.com`. |
 | `MUKAI_CHAT_WAIT_SECONDS` | no | How long chat tools wait by default. Default `55`. Keep it below your client's tool timeout. |
+| `MCP_APPROVAL_POLICY`, `MCP_SENSITIVE_TOOLS`, `MCP_TOOL_PROFILE`, … | no | Security policy. Safe by default; see [docs/SECURITY.md](docs/SECURITY.md#configuration). |
 
 ### Choosing `MUKAI_API_URL`
 
@@ -96,9 +104,10 @@ docker run -p 3333:3333 \
   -e MUKAI_API_TOKEN=... -e MCP_AUTH_TOKEN=... mukai-mcp
 ```
 
-The HTTP transport is **stateless**: each request gets a fresh server. You can run it on any
-container host (Fly.io, Railway, Render, Cloud Run, a VPS, …) without sticky sessions.
-Always put it behind HTTPS.
+The HTTP transport keeps **sessions in memory**. That is what lets the human's answer to a
+confirmation prompt reach the tool call that is waiting for it. Run **one instance**, or use
+sticky sessions if you scale out. It runs on any container host (Fly.io, Railway, Render,
+Cloud Run with session affinity, a VPS, …). Always put it behind HTTPS.
 
 ## Connect a client
 
@@ -109,8 +118,9 @@ claude mcp add --transport http mukai https://your-mcp-host/mcp \
   --header "Authorization: Bearer $MCP_AUTH_TOKEN"
 ```
 
-**Clients that only take a URL** (no custom headers): use `https://your-mcp-host/mcp?token=<MCP_AUTH_TOKEN>`.
-A token in a URL can end up in logs, so use the header wherever the client supports it.
+**Clients that only take a URL** (no custom headers): set `MCP_ALLOW_QUERY_TOKEN=true` and use
+`https://your-mcp-host/mcp?token=<MCP_AUTH_TOKEN>`. A token in a URL can end up in logs, so use
+the header wherever the client supports it.
 
 **Claude Desktop / other stdio clients**
 
@@ -126,16 +136,32 @@ A token in a URL can end up in logs, so use the header wherever the client suppo
 }
 ```
 
-## Security notes
+## Security
 
-- Anyone holding `MCP_AUTH_TOKEN` controls the Mukai installation as its owner. That includes
-  bots that run terminals and edit files. Treat the token like a root password.
-- Mukai's API token never leaves the MCP server, and `mukai_api_request` refuses
-  `/settings/api`, the route that would reveal it.
-- Destructive tools carry the MCP `destructiveHint` annotation, so clients can ask before running
-  them. Mukai's own safeguards still apply, for example deleting a workspace requires its exact
-  name.
-- To have bot tool calls wait for a human, use approval mode `ask-for-approval`.
+Safe by default: approvals and sensitive actions need a human, the raw API tool is off, results
+are labelled as untrusted data, and paths are validated. On top of that, a strong token is
+required, repeated auth failures lock the client out, and every call is written to an audit
+log. Anyone holding `MCP_AUTH_TOKEN` still has owner-level access within those limits, so
+treat it like a root password. The threat model and every setting are in
+**[docs/SECURITY.md](docs/SECURITY.md)**.
+
+## Tests
+
+`test/e2e.mjs` runs against a real Mukai backend with a mock model (`test/mock-llm.mjs`).
+It covers approve, reject, a dismissed prompt, model self-approval being blocked, approving
+from outside MCP while the tool waits, confirmation of sensitive actions, path traversal and
+auth lockout.
+
+```sh
+node test/mock-llm.mjs &                     # fake OpenAI-compatible model on :11434
+# start Mukai (npm run dev:server in the mukai repo) and this server (npm start), then:
+MUKAI_API_URL=http://127.0.0.1:47831 MUKAI_API_TOKEN=... \
+MCP_URL=http://127.0.0.1:3333/mcp MCP_AUTH_TOKEN=... TEST_FOLDER=/tmp/empty-dir \
+node test/e2e.mjs
+```
+
+Run `node scripts/gen-api-doc.mjs` after changing `src/endpoints.ts` to regenerate the API
+inventory.
 
 ## Not exposed as dedicated tools
 

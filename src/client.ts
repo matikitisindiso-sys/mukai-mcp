@@ -47,7 +47,17 @@ export class MukaiClient {
   }
 
   url(path: string, query?: Query) {
+    if (/[\\\0\r\n]/.test(path) || /(^|\/)(\.|%2e){1,2}(\/|$)/i.test(path) || path.includes('?') || path.includes('#'))
+      throw new MukaiApiError(400, 'Rejected an unsafe API path.');
+    const base = new URL(this.baseUrl);
     const url = new URL(this.baseUrl + (path.startsWith('/') ? path : '/' + path));
+    // The normalized URL must stay on the configured origin and under its base path.
+    const basePath = base.pathname.replace(/\/+$/, '');
+    if (url.origin !== base.origin || (basePath && !url.pathname.startsWith(basePath + '/')))
+      throw new MukaiApiError(400, 'Rejected an API path outside the Mukai API.');
+    const route = url.pathname.slice(basePath.length).replace(/\/+/g, '/');
+    // The backend's own API token must never be read through this server.
+    if (/^\/settings\/api\/?$/i.test(route)) throw new MukaiApiError(403, 'Reading the Mukai API token through MCP is not allowed.');
     for (const [key, value] of Object.entries(query || {}))
       if (value !== undefined && value !== null && value !== '') url.searchParams.set(key, String(value));
     return url;
