@@ -198,3 +198,14 @@ the mode and rules) come back to it rather than prompting the human.
 - **One owner.** Mukai has a single owner identity, so anyone holding `MCP_AUTH_TOKEN` is that
   owner within the limits above. There are no per-user roles yet. If you need them, run
   separate MCP deployments with different tokens and profiles (for example one `read-only`).
+
+## Reporting a vulnerability
+
+Please **don't open a public issue** for security problems. Instead, report them privately through
+GitHub: **Security → Report a vulnerability** on
+[matikitisindiso-sys/mukai-MCP](https://github.com/matikitisindiso-sys/mukai-MCP/security). Include
+the steps to reproduce and the version or commit you tested.
+
+You'll get an acknowledgement, and a fix is coordinated before any details are made public.
+Vulnerabilities in Mukai itself should be reported to the
+[Mukai project](https://github.com/munashesydney/mukai).

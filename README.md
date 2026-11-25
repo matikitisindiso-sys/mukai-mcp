@@ -1,242 +1,358 @@
 # Mukai MCP Server
 
-An [MCP](https://modelcontextprotocol.io) server that exposes the **existing HTTP API** of
-[Mukai](https://github.com/munashesydney/mukai) as tools. Deploy it anywhere that can reach your
-Mukai backend, and any MCP client (Claude, Claude Code, Cursor, etc.) can drive the whole system:
-workspaces, bots, chats and spaces, approvals, pursuits, memory, providers, skills, custom
-tools/routes/jobs, the browser, notifications, Telegram and settings.
+**Control a [Mukai](https://github.com/munashesydney/mukai) installation from any AI assistant that speaks
+the [Model Context Protocol](https://modelcontextprotocol.io) (MCP), such as Claude, ChatGPT, Claude Code or
+Cursor, from anywhere, safely.**
 
-It doesn't change Mukai at all. Each tool turns into a call to one of Mukai's own routes
-(`src/server/http/routes.ts` and `telegramRoutes.ts`), authenticated with Mukai's API token.
+Mukai already has a complete HTTP API. This server exposes that API as **143 MCP tools**. It adds
+the things a remote AI assistant needs on top: a sign-in flow, human-in-the-loop approvals,
+per-workspace permission rules, and security hardening. **It doesn't modify Mukai.**
 
+Author: **Sindiso Matikiti** · License: [MIT](LICENSE)
+
+---
+
+## Contents
+
+- [What it does](#what-it-does)
+- [How it works](#how-it-works)
+- [Features](#features)
+- [Approvals and permissions](#approvals-and-permissions)
+- [Security](#security)
+- [Quick start](#quick-start)
+- [Configuration](#configuration)
+- [Deployment](#deployment)
+- [Connecting an AI assistant](#connecting-an-ai-assistant)
+- [Limitations](#limitations)
+- [Troubleshooting](#troubleshooting)
+- [Development and tests](#development-and-tests)
+- [Project structure](#project-structure)
+- [License](#license)
+
+---
+
+## What it does
+
+Connect your AI assistant once, and it can work with your whole Mukai system in plain language:
+
+> "List my Mukai workspaces." · "Ask the Valorious bot to draft the launch plan." · "What's waiting for
+> my approval?" · "Approve the file write from Ada." · "Create a tester bot and give it the brief." ·
+> "Show me what the bot changed in `app.tsx`."
+
+- **The assistant acts as a manager. Mukai's bots are the team.** The assistant plans, briefs bots,
+  supervises their work, reviews results and handles approvals. The bots do the hands-on work:
+  code, files, terminal, browser and VM.
+- **Two-way approvals.** Requests raised in the Mukai app can be answered through the assistant, and
+  requests raised by work the assistant started show up in the Mukai app and Telegram as usual.
+- **You decide how much the assistant may decide on its own**, per workspace, using Mukai's own
+  approval modes plus a third, "I own it", and fine-grained rules.
+
+## How it works
+
+```mermaid
+flowchart LR
+    A[AI assistant<br/>Claude, ChatGPT, …] -- "MCP over HTTPS<br/>OAuth sign-in or token" --> M[Mukai MCP Server]
+    M -- "Mukai HTTP API<br/>API token + optional<br/>Cloudflare service token" --> K[Mukai backend]
+    K --> B[Bots: files, terminal,<br/>browser, VM, …]
+    K -. "approvals" .-> T[Telegram / Mukai app]
+    M -. "confirmation prompts" .-> H[You, in the<br/>assistant's app]
 ```
-MCP client ──(Streamable HTTP + bearer)──▶ mukai-mcp ──(Bearer api.token)──▶ Mukai backend
-```
 
-See **[docs/MUKAI_API.md](docs/MUKAI_API.md)** for every Mukai route and its tool, and
-**[docs/SECURITY.md](docs/SECURITY.md)** for the security model.
+The assistant gets things done in two ways:
 
-## Tools (143 by default, 56 in read-only, 144 in full)
+1. **It asks a Mukai bot.** For example: "open the browser and check the exchange rate". The bot
+   does the work with its own model and tools, under **Mukai's approval system**.
+2. **It calls Mukai directly.** It can manage workspaces, bots, memory, providers and so on, and
+   control an already-open browser tab in a local workspace. Mukai treats these calls as the owner,
+   so **this server's own rules** are what gate them.
 
-| Area | Tools |
+Chat replies stream from Mukai. The chat tools collect the stream and return the final text, the
+tool activity and anything waiting for a decision. Mukai runs live on the backend: if the
+assistant disconnects, the run continues, and sending the same `requestId` again reattaches to it.
+Approvals raised by **sub-bots** that the bot delegated to are caught too, within about two seconds.
+
+## Features
+
+| Area | What the assistant can do |
 | --- | --- |
-| Chat | `mukai_chat_with_bot`, `mukai_send_conversation_message`, `mukai_retry_conversation_message`, `mukai_stop_bot`, `mukai_stop_conversation`, follow-up queue/steer tools |
-| Workspaces | list, create, update, delete, timezone, VM computer status/start/stop/resources/setup |
-| Bots | list, create, `mukai_update_bot` (partial), replace, delete, set model, messages, files, artifacts, attachments, new private conversation |
-| Conversations / spaces | list (private / bot / history), create space, import, get, messages, outputs, terminal, trajectory, artifacts, saved, references, activity images, file changes |
-| Approvals | `mukai_list_pending_approvals` (everything waiting, from the app, Telegram, pursuits or MCP), approve/reject/answer, batch, Mukai's own mode, and MCP permissions: modes and rules per workspace (`mukai_get_mcp_permissions`, `mukai_set_mcp_approval_mode`, `mukai_set_mcp_rule`) |
-| Providers | list, create, update, delete, test, models, ChatGPT sign-in/disconnect |
-| Pursuits | list, get, delete, pause/resume, run now, run detail, retry, workpad |
-| Memory | snapshot, search, context, fact get/correct/forget, episodes, settings, embeddings, import/export, consolidate, clear |
-| Tools & capabilities | tool list + per-bot assignments, custom tool/route/job manage + test, route domain settings, environment variables |
-| Skills | list, get, preview, create, update, enable, delete |
-| Browser | sessions, screenshot, control (navigate/click/type/…) |
-| Inbox | notifications (read/dismiss/continue), failures |
-| Settings | profile, appearance, updates, limits, AI activity |
-| Telegram | status, connect, pairing, access, enable, disconnect |
-| Files | upload attachment, download artifact/attachment (images come back as images) |
-| Escape hatch | `mukai_api_request`: any route without a dedicated tool. Off unless `MCP_ENABLE_RAW_API=true` |
+| **Chat** | Talk to bots, private chats, spaces and bot threads; retry, stop, queue and steer follow-ups |
+| **Workspaces** | List, create, update, delete, timezone; start/stop/size VM computers |
+| **Bots** | List, create, partially update, change model, delete; messages, files, artifacts, attachments |
+| **Conversations** | Messages, outputs, terminal snapshots, trajectories, artifacts, file-change diffs |
+| **Approvals** | Everything waiting (from the app, Telegram, pursuits or MCP); approve, reject, answer questions |
+| **Permissions** | Per-workspace MCP mode and rules (`mukai_get_mcp_permissions`, `mukai_set_mcp_rule`, …) |
+| **Pursuits** | List, inspect, pause/resume, run now, retry, workpad |
+| **Memory** | Snapshot, search, context, correct/forget facts, settings, import/export |
+| **Providers** | List, add, update, test, models, ChatGPT sign-in |
+| **Skills and custom code** | Skills; custom tools, routes and jobs; environment variables |
+| **Browser** | Sessions, screenshots (the assistant can look at them), navigate/click/type in an open tab |
+| **Inbox and settings** | Notifications, failures, profile, appearance, limits, updates, Telegram |
 
-### How chat and approvals work
+The full route-by-route inventory, generated from the code, is in
+**[docs/MUKAI_API.md](docs/MUKAI_API.md)**.
 
-Mukai streams chat replies. The chat tools read that stream and return the final text, the tool
-activity, and any pending approvals in one result. Mukai runs live on the backend:
-disconnecting never cancels a run, and sending the same `requestId` again reattaches to it.
+## Approvals and permissions
 
-When a bot needs approval, a **mode** per workspace decides who answers, and **rules** can
-adjust it per category:
-- **ask-for-approval** (the default): you decide everything.
-- **full-access** (like Mukai's): Claude decides bot tool requests; questions stay with you.
-- **i-own-it**: Claude decides everything, questions and yes/no included.
+### Modes (per workspace)
 
-Rules such as "never approve terminal commands for me" or "Claude may delete in my sandbox" can
-be set by you through Claude (loosening needs your confirmation) or by the operator in a
-lockable rules file. Sensitive actions Claude takes itself (deleting, providers, custom code…)
-need your confirmation in every mode unless a rule allows them. See
-[docs/SECURITY.md](docs/SECURITY.md#two-kinds-of-permission).
+| Mode | Bot tool requests (files, terminal, browser…) | Bot questions and yes/no go-aheads | The assistant's sensitive actions |
+| --- | --- | --- | --- |
+| **ask-for-approval** *(default)* | You decide | You decide | You confirm |
+| **full-access** (like Mukai's) | The assistant decides | You decide | You confirm |
+| **i-own-it** | The assistant decides | The assistant decides | You confirm |
 
-In ask-for-approval:
-- In clients that support MCP elicitation (confirmation prompts), the human gets a prompt built
-  from Mukai's own record of the request. Their choice is applied and the tool waits for the
-  rest of the reply.
-- Requests raised **in the Mukai app** (tool approvals, questions with suggested answers, yes/no
-  go-aheads) show up via `mukai_list_pending_approvals` and can be answered with
-  `mukai_decide_approval` while you're away from your desk.
-- Otherwise the result is `status: "awaiting_approval"` with `pendingApprovals`, and the human
-  approves in **Telegram** or the Mukai app. Telegram receives every pending approval no matter
-  who started the run, so MCP-triggered requests show up there too. Re-call with the same
-  `requestId`, or use `approvalHandling: "wait"`, to collect the reply.
+### Rules (fine-tuning)
 
-Sensitive actions (deletes, providers, custom code, skills, workspace folders, Telegram,
-secrets, turning on full access) need the same kind of human confirmation. Details are in
-[docs/SECURITY.md](docs/SECURITY.md).
+Rules say `allow` or `ask` for one category and override the mode. They can apply to one
+workspace or to all of them.
 
-## Setup
+- **Bot requests:** `files-read`, `files-write`, `files-overwrite`, `terminal`, `browser`,
+  `computer-use`, `web`, `bots`, `pursuits`, `custom-code`, `custom-tools`, `questions`, `yes-no`,
+  `other`.
+- **The assistant's own actions:** `delete`, `providers`, `custom-code`, `secrets`, `skills`,
+  `memory-edit`, `workspace-setup`, `telegram`, `settings`, `browser-control`, `raw-api`.
 
-Requires Node.js 20+.
+Examples: *"I own it, but never approve terminal commands for me"* → `requests.terminal = ask`.
+*"In my sandbox, the assistant may delete things"* → `actions.delete = allow`.
+
+**Who can change them:**
+- **You, through the assistant.** Making anything looser requires your confirmation and doesn't
+  take effect until you confirm. Making things stricter never asks.
+- **The operator, in a lockable rules file** (`MCP_RULES_FILE`; see [`rules.example.json`](rules.example.json)).
+  Locked entries can't be changed through MCP.
+
+### How you decide
+
+- **In the assistant's app.** Where the client supports MCP confirmation prompts (elicitation), you
+  see a box built from **Mukai's own record** of the request, never from the assistant's
+  description, and your choice is applied.
+- **In Telegram or the Mukai app.** These always work. Mukai sends every pending request to
+  Telegram, wherever it started, and whoever answers first wins.
+
+Full details: **[docs/SECURITY.md](docs/SECURITY.md#two-kinds-of-permission)**.
+
+## Security
+
+Safe by default. Highlights:
+
+- **Sign-in:** OAuth 2.1 with PKCE and an owner-password login page, plus an optional static
+  token (32+ characters). Access tokens last 1 hour; refresh tokens last 30 days, rotate on every
+  use, and **reuse of an old one ends the sign-in**. Only allowlisted apps (Claude by default) can
+  register.
+- **The assistant can't approve on your behalf** unless your mode or rules say so.
+  Sensitive actions (deleting, providers, custom code, secrets…) need your confirmation.
+- **Prompt-injection resistant:** everything returned from Mukai is labelled as untrusted data,
+  and confirmation prompts come from Mukai's records rather than from model text.
+- **Hardened transport:** path-traversal guard, Host allowlist, request size limits, and lockout
+  after repeated failures. Lockout tracks each visitor's real address, including behind Cloudflare.
+- **Secrets stay put:** Mukai's API token never leaves the server, the route that would reveal it
+  is blocked, keys are redacted from logs and prompts, and tokens are stored only as hashes.
+- **Audit log** of every tool call and decision.
+- **Cloudflare Zero Trust:** supported with a revocable service token.
+
+Threat model, every setting and a deployment checklist: **[docs/SECURITY.md](docs/SECURITY.md)**.
+To report a vulnerability, see [Reporting a vulnerability](docs/SECURITY.md#reporting-a-vulnerability).
+
+## Quick start
+
+Requires **Node.js 20+** and a running Mukai backend.
 
 ```sh
+git clone https://github.com/matikitisindiso-sys/mukai-MCP.git
+cd mukai-MCP
 npm ci
 npm run build
-cp .env.example .env   # then fill in values; export them or use your platform's secret store
+
+export MUKAI_API_URL=http://127.0.0.1:47831      # your Mukai backend
+export MUKAI_API_TOKEN=...                        # Mukai → Settings → API
+export MCP_AUTH_TOKEN=$(openssl rand -hex 32)     # what clients send to this server
+npm start                                          # MCP endpoint: http://localhost:3333/mcp
 ```
 
-| Variable | Required | Description |
-| --- | --- | --- |
-| `MUKAI_API_URL` | yes | Mukai backend base URL. See below. |
-| `MUKAI_CF_ACCESS_CLIENT_ID` / `MUKAI_CF_ACCESS_CLIENT_SECRET` | if Mukai is behind Cloudflare Access | Cloudflare Access service token. See below. |
-| `MUKAI_API_TOKEN` | yes | Mukai API token. Find it in **Mukai → Settings → API**, or read it from the `api.token` file in the Mukai data directory (that file holds raw bytes; the token is their hex: `od -An -tx1 -v api.token \| tr -d ' \n'`). |
-| `MCP_PUBLIC_URL` / `MCP_OWNER_PASSWORD` | for OAuth sign-in (Claude app) | Public HTTPS address of this server and the owner password for the login page. See "Claude app" below. |
-| `MCP_AUTH_TOKEN` | HTTP mode, unless OAuth is set | Bearer token that clients must send to this server, at least 32 characters. Generate one with `openssl rand -hex 32`. |
-| `PORT` / `HOST` | no | Listener address. Defaults to `3333` / `0.0.0.0`. |
-| `MCP_ALLOWED_HOSTS` | no | Comma-separated allowlist for the `Host` header, which protects against DNS rebinding, e.g. `mcp.example.com`. |
-| `MUKAI_CHAT_WAIT_SECONDS` | no | How long chat tools wait by default. Default `55`. Keep it below your client's tool timeout. |
-| `MCP_APPROVAL_MODE`, `MCP_SENSITIVE_TOOLS`, `MCP_TOOL_PROFILE`, … | no | Security policy. Safe by default; see [docs/SECURITY.md](docs/SECURITY.md#configuration). |
+Check it: `curl http://localhost:3333/health` → `{"status":"ok",…}`.
 
-### Mukai behind Cloudflare Zero Trust (Access)
+## Configuration
 
-If Mukai is protected by Cloudflare Access, give the MCP server a **service token**. It's a
-deliberate, revocable key for this program; nothing is bypassed.
+All settings are environment variables. See [`.env.example`](.env.example) for a template.
 
-1. In Cloudflare Zero Trust: **Access → Service Auth → Create service token**. Copy the Client
-   ID and Client Secret.
-2. In Mukai's Access application, add a policy with action **Service Auth** that includes that
-   token. Your login policy for people stays as it is.
-3. Set `MUKAI_CF_ACCESS_CLIENT_ID` and `MUKAI_CF_ACCESS_CLIENT_SECRET`. The MCP server sends
-   them on every request to Mukai, including streamed chats.
+**Connecting to Mukai**
 
-Notes:
-- The server refuses to start if only one of the two is set, or if `MUKAI_API_URL` is plain
-  HTTP to another machine (the token would travel unencrypted).
-- If Access blocks a request, tools report "Blocked before reaching Mukai … check the service
-  token / Service Auth policy". Redirects are never followed, so Cloudflare's login page is
-  never mistaken for Mukai data.
-- To cut off access, revoke the token in Cloudflare. Mukai's own API token is still required on
-  top, so this is two locks rather than one.
-- If the MCP server runs **on the same machine** as Mukai, you can skip Cloudflare entirely and
-  use `http://127.0.0.1:47831`. That path never leaves the machine. Use the service token
-  when they're on different machines, or everywhere if you want Cloudflare's off switch and
-  logs.
+| Variable | Description |
+| --- | --- |
+| `MUKAI_API_URL` | Mukai's API address. Same machine: `http://127.0.0.1:47831`. Remote (behind `mukai serve` and a tunnel or proxy): `https://your-mukai-domain/api`. |
+| `MUKAI_API_TOKEN` | Mukai's API token (**Settings → API**). |
+| `MUKAI_CF_ACCESS_CLIENT_ID` / `MUKAI_CF_ACCESS_CLIENT_SECRET` | Cloudflare Access service token, if Mukai is behind Zero Trust. |
+| `MUKAI_CHAT_WAIT_SECONDS` | How long chat tools wait before returning. Default `55`; keep it below your client's timeout. |
 
-### Choosing `MUKAI_API_URL`
+**Access to this server**
 
-- **MCP server on the same machine as Mukai** (Desktop, `npm run dev:server`, or `mukai serve`):
-  `http://127.0.0.1:47831`. Run `mukai status` to see the real port.
-- **MCP server somewhere else** (cloud, VPS): expose `mukai serve` through your HTTPS tunnel or
-  reverse proxy, then use `https://your-mukai-domain/api`. The proxy must keep the original
-  `Host` header. Mukai accepts these remote requests because they carry the bearer token and no
-  browser `Origin` header, and the MCP server never sends one.
+| Variable | Description |
+| --- | --- |
+| `MCP_PUBLIC_URL` | Public HTTPS address of this server, e.g. `https://mcp.example.com`. Required for OAuth. |
+| `MCP_OWNER_PASSWORD` | Owner password for the OAuth login page (12+ characters). Turns OAuth on. |
+| `MCP_AUTH_TOKEN` | Static bearer token (32+ characters), e.g. for Claude Code. Optional when OAuth is on. |
+| `MCP_OAUTH_REDIRECT_HOSTS` | Apps allowed to sign in. Default `claude.ai,claude.com`; add `chatgpt.com` for ChatGPT. |
+| `MCP_ALLOWED_HOSTS` | Host allowlist, e.g. `mcp.example.com`. |
+| `MCP_TRUST_PROXY` | `cloudflare` behind a Cloudflare Tunnel, a number of proxies, `true`, or `false` (default). |
+| `PORT` / `HOST` | Listener. Default `3333` / `0.0.0.0`. |
 
-## Run
+**Permissions and policy**
 
-```sh
-# Remote / Streamable HTTP (endpoint: POST /mcp, health: GET /health)
-MUKAI_API_URL=... MUKAI_API_TOKEN=... MCP_AUTH_TOKEN=... npm start
+| Variable | Description |
+| --- | --- |
+| `MCP_APPROVAL_MODE` | Default mode: `ask-for-approval` (default), `full-access` or `i-own-it`. |
+| `MCP_RULES_FILE` | Operator rules file (JSON, lockable). |
+| `MCP_SENSITIVE_TOOLS` | `confirm` (default), `disable` or `allow`. |
+| `MCP_TOOL_PROFILE` | `standard` (143 tools, default), `read-only` (56) or `full` (144, adds a raw API tool). |
+| `MCP_STATE_FILE` / `MCP_OAUTH_STATE_FILE` | Where modes, rules and sign-ins are saved (`data/`). Keep them on persistent storage. |
 
-# Local stdio (for a client that launches the process itself)
-MUKAI_API_URL=... MUKAI_API_TOKEN=... node dist/index.js --stdio
-```
+The complete list, including session limits, timeouts and audit logging, is in
+[docs/SECURITY.md](docs/SECURITY.md#configuration).
 
-Docker:
+## Deployment
+
+The server runs as **a single container**, built from the included `Dockerfile`. Sessions live in
+memory, so run **one instance**, or use sticky sessions. Mount a **persistent volume at
+`/app/data`**.
 
 ```sh
 docker build -t mukai-mcp .
-docker run -p 3333:3333 \
-  -e MUKAI_API_URL=https://your-mukai-domain/api \
-  -e MUKAI_API_TOKEN=... -e MCP_AUTH_TOKEN=... mukai-mcp
+docker run -p 3333:3333 -v mukai-mcp-data:/app/data \
+  -e MUKAI_API_URL=https://mukai.example.com/api -e MUKAI_API_TOKEN=... \
+  -e MCP_PUBLIC_URL=https://mcp.example.com -e MCP_OWNER_PASSWORD=... \
+  mukai-mcp
 ```
 
-The HTTP transport keeps **sessions in memory**. That is what lets the human's answer to a
-confirmation prompt reach the tool call that is waiting for it. Run **one instance**, or use
-sticky sessions if you scale out. It runs on any container host (Fly.io, Railway, Render,
-Cloud Run with session affinity, a VPS, …). Always put it behind HTTPS.
+### Coolify with a Cloudflare Tunnel (reference setup)
 
-## Connect a client
+1. **Coolify:**
+   - **Create the app:** new resource from this repository, branch `main`, build pack **Dockerfile**, port `3333`.
+   - **Domain:** `http://mcp.example.com`. Use `http`: Cloudflare provides HTTPS to visitors, and this avoids certificate loops inside Coolify.
+   - **Storage:** add a volume at `/app/data`.
+   - **Health check:** the Dockerfile's built-in one is used automatically.
+2. **Environment:** `MUKAI_API_URL`, `MUKAI_API_TOKEN`, `MCP_PUBLIC_URL=https://mcp.example.com`,
+   `MCP_OWNER_PASSWORD`, `MCP_ALLOWED_HOSTS=mcp.example.com`, `MCP_TRUST_PROXY=cloudflare`.
+3. **Cloudflare Tunnel:** route `mcp.example.com` to Coolify's proxy (a wildcard route also works).
+4. **Cloudflare Access:**
+   - `mcp.example.com`: a **Bypass** policy. AI apps can't complete Cloudflare's login, and this server has its own.
+   - Mukai's domain: keep your login policy, and add a **Service Auth** policy for the service token in `MUKAI_CF_ACCESS_CLIENT_ID/SECRET`. **Don't use Bypass on Mukai.**
+5. **Firewall:** make sure the server is only reachable through Cloudflare. With a Tunnel, no inbound ports are needed.
+
+After deploying, the log line should read
+`… [trustProxy=cloudflare oauth=on … cloudflareAccess=service-token …]`, and
+`https://mcp.example.com/health` should return `{"status":"ok"}`.
+
+## Connecting an AI assistant
+
+**Claude app (custom connector)**
+
+1. **Settings → Connectors → Add custom connector**, URL `https://mcp.example.com/mcp`. No token
+   is needed.
+2. A **Connect to Mukai** page opens. Enter the owner password and press **Allow**.
+3. Ask: *"List my Mukai workspaces."*
+
+**ChatGPT** (where your plan supports MCP connectors / Developer mode): add `chatgpt.com` to
+`MCP_OAUTH_REDIRECT_HOSTS`, then add a connector with the same URL and OAuth sign-in.
 
 **Claude Code**
 
 ```sh
-claude mcp add --transport http mukai https://your-mcp-host/mcp \
+claude mcp add --transport http mukai https://mcp.example.com/mcp \
   --header "Authorization: Bearer $MCP_AUTH_TOKEN"
 ```
 
-**Claude app (custom connector), with OAuth sign-in**
-
-1. On the server, set:
-   - `MCP_PUBLIC_URL=https://your-mcp-host` (the public HTTPS address, no path);
-   - `MCP_OWNER_PASSWORD`: at least 12 characters; you'll type it once when connecting.
-2. In the Claude app: **Settings → Connectors → Add custom connector**, URL
-   `https://your-mcp-host/mcp`, with no token in it.
-3. The app opens a **Connect to Mukai** page. Enter the owner password and press **Allow**.
-
-The app then receives an access token that expires after an hour and renews itself, and a
-refresh token that lasts 30 days and is replaced on every use. Neither is ever shown to you or
-put in a URL.
-
-- **Who can register:** only callback addresses on `claude.ai` and `claude.com`, plus localhost
-  for local apps. Change this with `MCP_OAUTH_REDIRECT_HOSTS`.
-- **To sign every app out:** change `MCP_OWNER_PASSWORD` and redeploy, or run
-  `node dist/index.js --revoke-oauth` with the same settings.
-- **Theft detection:** if an old refresh token is ever reused, that whole sign-in is ended
-  automatically.
-- **Static token too:** `MCP_AUTH_TOKEN` keeps working alongside OAuth, e.g. for Claude Code with
-  a header.
-
-**Clients that can neither sign in with OAuth nor send headers:** set
-`MCP_ALLOW_QUERY_TOKEN=true` and use `https://your-mcp-host/mcp?token=<MCP_AUTH_TOKEN>`. This is a
-last resort; a token in a URL can end up in logs.
-
-**Claude Desktop / other stdio clients**
+**Local stdio clients** (the client starts the server itself):
 
 ```json
 {
   "mcpServers": {
     "mukai": {
       "command": "node",
-      "args": ["/path/to/mukai-mcp/dist/index.js", "--stdio"],
+      "args": ["/path/to/mukai-MCP/dist/index.js", "--stdio"],
       "env": { "MUKAI_API_URL": "http://127.0.0.1:47831", "MUKAI_API_TOKEN": "..." }
     }
   }
 }
 ```
 
-## Security
+**Signing everyone out:** change `MCP_OWNER_PASSWORD` and redeploy, or run
+`node dist/index.js --revoke-oauth`.
 
-Safe by default: approvals and sensitive actions need a human, the raw API tool is off, results
-are labelled as untrusted data, and paths are validated. On top of that, a strong token is
-required, repeated auth failures lock the client out, and every call is written to an audit
-log. Anyone holding `MCP_AUTH_TOKEN` still has owner-level access within those limits, so
-treat it like a root password. The threat model and every setting are in
-**[docs/SECURITY.md](docs/SECURITY.md)**.
+## Limitations
 
-## Tests
+- **What needs a bot.** The assistant can't open a new browser, browse workspace files, run
+  terminal commands or see a VM's screen directly; Mukai's API doesn't offer these. It asks a
+  bot instead, under Mukai's approvals.
+- **Direct browser control** works for an already-open tab in **local** workspaces. In VM
+  workspaces the browser runs inside the VM; use a bot there.
+- **The assistant only knows what it asks for.** It finds out automatically about anything it
+  started, including sub-bots. Other pending requests appear when it checks, e.g. when you ask
+  "anything waiting for me?". Telegram remains the real-time alert.
+- **Confirmation prompts depend on the client.** Where a client can't show them, decisions that
+  need you go to Telegram or the Mukai app, and sensitive actions are refused unless a rule allows
+  them.
+- **One instance per deployment,** because sessions are held in memory.
 
-`test/e2e.mjs` runs against a real Mukai backend with a mock model (`test/mock-llm.mjs`).
-It covers approve, reject, a dismissed prompt, model self-approval being blocked, approving
-from outside MCP while the tool waits, answering app-raised questions/approvals via MCP, confirmation of sensitive actions, path traversal and
-auth lockout.
+## Troubleshooting
+
+| Symptom | Cause and fix |
+| --- | --- |
+| Cloudflare **"Forbidden"** page on the MCP domain | An Access application, often a wildcard, covers it. Add a **Bypass** application for the MCP domain. |
+| Tools say **"Blocked before reaching Mukai"** | Cloudflare Access is stopping the server → Mukai hop. Add a **Service Auth** policy for the service token on Mukai's Access application, and check the Client ID and Secret. |
+| Deployment rolled back, health check **403** | You're on an old version; update. `/health` now answers before the Host allowlist. |
+| Pressing **Allow** on the login page does nothing | You're on an old version; update. |
+| App sign-in fails right after **Allow** | Check the log for `oauth.registration_refused` and add that app's host to `MCP_OAUTH_REDIRECT_HOSTS`. |
+| Everyone gets **429 Too many failed attempts** | Behind a proxy without `MCP_TRUST_PROXY`, everyone shares one address. Set `cloudflare` (Tunnel) or the proxy count. |
+| Chat tool returns `timeout` | The bot is still working. Call again with the same `requestId` to keep waiting. |
+
+## Development and tests
 
 ```sh
-node test/mock-llm.mjs &                     # fake OpenAI-compatible model on :11434
-# start Mukai (npm run dev:server in the mukai repo) and this server (npm start), then:
+npm run build        # compile TypeScript to dist/
+npm run dev          # run from source
+npm test             # unit and browser tests (no Mukai needed)
+```
+
+| Suite | What it covers | Needs |
+| --- | --- | --- |
+| `npm test` (10) | Permission rules, operator locks, lockout behind Cloudflare, health check, login page in a real browser | Nothing |
+| `test/e2e.mjs` (24) | Approvals in every mode, app-raised requests, sub-bots, rules, hardening | Mukai and `test/mock-llm.mjs` |
+| `test/oauth.mjs` (9) | The full sign-in flow and attacks: bad callbacks, PKCE, code reuse, refresh-token theft, restarts, password change | Mukai |
+| `test/cf-access.mjs` (5) | A Cloudflare Access gate in front of Mukai: no token, wrong token, right token with streamed chat | Mukai |
+
+The end-to-end suites run against a real Mukai backend, with `test/mock-llm.mjs` as a fake
+OpenAI-compatible model:
+
+```sh
+node test/mock-llm.mjs &
 MUKAI_API_URL=http://127.0.0.1:47831 MUKAI_API_TOKEN=... \
 MCP_URL=http://127.0.0.1:3333/mcp MCP_AUTH_TOKEN=... TEST_FOLDER=/tmp/empty-dir \
 node test/e2e.mjs
 ```
 
-Unit tests for the permission rules (no backend needed): `npm test`.
-OAuth sign-in test (the Claude app flow plus attacks): `node test/oauth.mjs` with `MUKAI_API_URL`,
-`MUKAI_API_TOKEN` and `TEST_FOLDER`.
-Cloudflare Access test (fake Access gate in front of a real Mukai): `node test/cf-access.mjs` with
-`MUKAI_API_URL`, `MUKAI_API_TOKEN` and `TEST_FOLDER`.
+After changing `src/endpoints.ts`, regenerate the API inventory with `node scripts/gen-api-doc.mjs`.
 
-Run `node scripts/gen-api-doc.mjs` after changing `src/endpoints.ts` to regenerate the API
-inventory.
+## Project structure
 
-## Not exposed as dedicated tools
+```
+src/
+  index.ts       HTTP and stdio entry point, sessions, sign-in checks, lockout
+  tools.ts       Tool registration, approvals, chat streaming, permission enforcement
+  endpoints.ts   Declarative map of Mukai's API routes to tools
+  rules.ts       Modes, rule categories, operator and user rules, precedence
+  oauth.ts       OAuth 2.1 provider and the owner login page
+  security.ts    Policy, confirmations, redaction, audit log, lockout
+  client.ts      Mukai API client (path guard, Cloudflare Access, streaming chat)
+docs/
+  SECURITY.md    Threat model, permissions, configuration, vulnerability reporting
+  MUKAI_API.md   Generated inventory of Mukai's routes and their tools
+test/            Unit, browser and end-to-end suites, plus a mock model
+```
 
-These stay reachable through `mukai_api_request` where that makes sense:
-- Push-device registration (`/push/*`). It needs a per-device session header.
-- The VM desktop/audio view sessions. They are WebSocket streams for the UI.
-- `GET /settings/api`. It returns the backend token, so it's blocked.
-- `/environment/export`, a file download of secrets.
+## License
+
+[MIT](LICENSE) © 2026 Sindiso Matikiti.
+
+Mukai itself is a separate project by its own authors:
+[github.com/munashesydney/mukai](https://github.com/munashesydney/mukai). This server talks to it only
+through its public HTTP API.

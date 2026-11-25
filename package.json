@@ -1,7 +1,23 @@
 {
   "name": "mukai-mcp",
-  "version": "0.4.0",
-  "description": "MCP server exposing the Mukai backend HTTP API as tools.",
+  "version": "1.0.0",
+  "description": "MCP server for Mukai: control a Mukai installation from Claude, ChatGPT and other MCP clients, with OAuth sign-in, human-in-the-loop approvals and permission rules.",
+  "author": "Sindiso Matikiti",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/matikitisindiso-sys/mukai-MCP.git"
+  },
+  "homepage": "https://github.com/matikitisindiso-sys/mukai-MCP#readme",
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "mukai",
+    "claude",
+    "chatgpt",
+    "ai-agents",
+    "oauth"
+  ],
   "type": "module",
   "private": true,
   "bin": {

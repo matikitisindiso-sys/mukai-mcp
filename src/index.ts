@@ -13,7 +13,7 @@ import { PermissionStore } from './rules.js';
 import { MukaiOAuth } from './oauth.js';
 import { mcpAuthRouter, getOAuthProtectedResourceMetadataUrl } from '@modelcontextprotocol/sdk/server/auth/router.js';
 
-const VERSION = '0.4.0';
+const VERSION = '1.0.0';
 
 function env(name: string, fallback?: string) {
   const value = process.env[name]?.trim();
